@@ -1,0 +1,34 @@
+name: FPGA_ML
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+
+  # Core scientific stack
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - tqdm
+
+  # PyTorch stack (for SNN baseline)
+  - pytorch
+  - torchvision
+  - torchaudio
+
+  # Model exchange / runtime
+  - onnx
+  - onnxruntime
+
+  # Optional but useful for notebook/debug
+  - jupyterlab
+
+  # Packages that are typically pip-installed
+  - pip:
+      - spikingjelly
+      - hls4ml
+      - tensorflow
+      - qkeras

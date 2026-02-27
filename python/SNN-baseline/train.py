@@ -1,14 +1,17 @@
 import argparse
+import gzip
+import shutil
 import struct
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from typing import Union
 
 from spikingjelly.activation_based import encoding, functional, layer, neuron, surrogate
 
@@ -89,6 +92,84 @@ class MNISTConvSNN(nn.Module):
 		return self.net(x_seq)
 
 
+def _pick_existing_file(base_dir: Path, candidates: list[str]) -> Path:
+	for name in candidates:
+		path = base_dir / name
+		if path.exists():
+			return path
+	raise FileNotFoundError(f'None of candidates found in {base_dir}: {candidates}')
+
+
+def ensure_mnist_dataset(raw_dir: Path) -> tuple[Path, Path, Path, Path]:
+	raw_dir = raw_dir.resolve()
+	train_img_candidates = ['train-images-idx3-ubyte', 'train-images.idx3-ubyte']
+	train_lbl_candidates = ['train-labels-idx1-ubyte', 'train-labels.idx1-ubyte']
+	test_img_candidates = ['t10k-images-idx3-ubyte', 't10k-images.idx3-ubyte']
+	test_lbl_candidates = ['t10k-labels-idx1-ubyte', 't10k-labels.idx1-ubyte']
+
+	def has_complete_dataset() -> bool:
+		return (
+			any((raw_dir / name).exists() for name in train_img_candidates)
+			and any((raw_dir / name).exists() for name in train_lbl_candidates)
+			and any((raw_dir / name).exists() for name in test_img_candidates)
+			and any((raw_dir / name).exists() for name in test_lbl_candidates)
+		)
+
+	def download_mnist_with_fallback(raw_folder: Path) -> None:
+		raw_folder.mkdir(parents=True, exist_ok=True)
+		files = [
+			'train-images-idx3-ubyte.gz',
+			'train-labels-idx1-ubyte.gz',
+			't10k-images-idx3-ubyte.gz',
+			't10k-labels-idx1-ubyte.gz',
+		]
+		mirrors = [
+			'https://ossci-datasets.s3.amazonaws.com/mnist',
+			'https://storage.googleapis.com/cvdf-datasets/mnist',
+		]
+
+		for gz_name in files:
+			gz_path = raw_folder / gz_name
+			raw_name = gz_name[:-3]
+			raw_path = raw_folder / raw_name
+			if raw_path.exists():
+				continue
+
+			last_err = None
+			for base in mirrors:
+				url = f'{base}/{gz_name}'
+				try:
+					print(f'downloading {url}')
+					urllib.request.urlretrieve(url, gz_path)
+					break
+				except Exception as ex:
+					last_err = ex
+			else:
+				raise RuntimeError(f'Failed to download {gz_name} from fallback mirrors: {last_err}')
+
+			with gzip.open(gz_path, 'rb') as src, raw_path.open('wb') as dst:
+				shutil.copyfileobj(src, dst)
+
+	if not has_complete_dataset():
+		root_dir = raw_dir.parent.parent if raw_dir.name == 'raw' and raw_dir.parent.name == 'MNIST' else raw_dir.parent
+		print(f'MNIST dataset incomplete under {raw_dir}, downloading to {root_dir} ...')
+		from torchvision import datasets
+
+		try:
+			datasets.MNIST(root=str(root_dir), train=True, download=True)
+			datasets.MNIST(root=str(root_dir), train=False, download=True)
+		except Exception as ex:
+			print(f'torchvision download failed: {ex}')
+			print('trying fallback mirrors ...')
+			download_mnist_with_fallback(raw_dir)
+
+	train_images = _pick_existing_file(raw_dir, train_img_candidates)
+	train_labels = _pick_existing_file(raw_dir, train_lbl_candidates)
+	test_images = _pick_existing_file(raw_dir, test_img_candidates)
+	test_labels = _pick_existing_file(raw_dir, test_lbl_candidates)
+	return train_images, train_labels, test_images, test_labels
+
+
 def save_checkpoint(path: Path, model: nn.Module, cfg: 'TrainConfig', epoch: int, acc: float) -> None:
 	path.parent.mkdir(parents=True, exist_ok=True)
 	ckpt = {
@@ -131,7 +212,7 @@ class TrainConfig:
 	epochs: int = 10
 	lr: float = 1e-3
 	num_workers: int = 0
-	device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+	device: str = 'cuda'
 
 
 @torch.no_grad()
@@ -178,7 +259,7 @@ def train_one_epoch(model: nn.Module, encoder: encoding.PoissonEncoder, loader: 
 
 def main() -> int:
 	parser = argparse.ArgumentParser()
-	parser.add_argument('--data-dir', type=str, default=str(Path(__file__).resolve().parent / 'dates'))
+	parser.add_argument('--data-dir', type=str, default=str(Path(__file__).resolve().parent / 'datas' / 'MNIST' / 'raw'))
 	parser.add_argument('--T', type=int, default=8)
 	parser.add_argument('--channels', type=int, default=16)
 	parser.add_argument('--batch-size', type=int, default=64)
@@ -189,9 +270,10 @@ def main() -> int:
 	parser.add_argument('--scheduler', type=str, default='cosine', choices=['none', 'cosine', 'step'])
 	parser.add_argument('--step-size', type=int, default=50)
 	parser.add_argument('--gamma', type=float, default=0.5)
-	parser.add_argument('--save', type=str, default=str(Path(__file__).resolve().parent / 'mnist_snn.pt'))
+	parser.add_argument('--save', type=str, default=str(Path(__file__).resolve().parent / 'weights' / 'fp32' / 'mnist_snn_baseline.pt'))
 	parser.add_argument('--load', type=str, default='')
 	parser.add_argument('--eval-only', action='store_true')
+	parser.add_argument('--device', type=str, default='', help='training device, default uses cuda if available else cpu')
 	parser.add_argument('--resume', action='store_true', help='when used with --load, also resume optimizer/scheduler and epoch')
 	parser.add_argument('--save-every', type=int, default=50, help='save a periodic checkpoint every N epochs (0 disables)')
 	args = parser.parse_args()
@@ -200,11 +282,19 @@ def main() -> int:
 	if torch.cuda.is_available():
 		torch.cuda.manual_seed_all(args.seed)
 
-	cfg = TrainConfig(T=args.T, channels=args.channels, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
-	data_dir = Path(args.data_dir)
+	selected_device = args.device.strip() if isinstance(args.device, str) else ''
+	if selected_device == '':
+		selected_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+	elif selected_device == 'cuda' and not torch.cuda.is_available():
+		print('CUDA requested but unavailable, fallback to CPU.')
+		selected_device = 'cpu'
 
-	train_ds = MNISTIdxDataset(data_dir / 'train-images.idx3-ubyte', data_dir / 'train-labels.idx1-ubyte')
-	test_ds = MNISTIdxDataset(data_dir / 't10k-images.idx3-ubyte', data_dir / 't10k-labels.idx1-ubyte')
+	cfg = TrainConfig(T=args.T, channels=args.channels, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr, device=selected_device)
+	data_dir = Path(args.data_dir)
+	train_images, train_labels, test_images, test_labels = ensure_mnist_dataset(data_dir)
+
+	train_ds = MNISTIdxDataset(train_images, train_labels)
+	test_ds = MNISTIdxDataset(test_images, test_labels)
 
 	train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available())
 	test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available())

@@ -17,8 +17,8 @@ import train as snn_train
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Test the trained SNN model (MNIST).')
-    parser.add_argument('--data-dir', type=str, default=str(Path(__file__).resolve().parent / 'dates'))
-    parser.add_argument('--ckpt', type=str, default=str(Path(__file__).resolve().parent / 'mnist_snn.pt'))
+    parser.add_argument('--data-dir', type=str, default=str(Path(__file__).resolve().parent / 'datas' / 'MNIST' / 'raw'))
+    parser.add_argument('--ckpt', type=str, default=str(Path(__file__).resolve().parent / 'weights' / 'fp32' / 'mnist_snn_baseline.pt'))
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--T', type=int, default=0, help='override time steps; 0 means use checkpoint/default')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -35,8 +35,8 @@ def main() -> int:
 
     # 准备数据
     test_ds = snn_train.MNISTIdxDataset(
-        data_dir / 't10k-images.idx3-ubyte',
-        data_dir / 't10k-labels.idx1-ubyte',
+        data_dir / 't10k-images-idx3-ubyte',
+        data_dir / 't10k-labels-idx1-ubyte',
     )
     test_loader = DataLoader(
         test_ds,

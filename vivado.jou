@@ -1,0 +1,24 @@
+#-----------------------------------------------------------
+# Vivado v2025.2 (64-bit)
+# SW Build 6299465 on Fri Nov 14 12:34:56 MST 2025
+# IP Build 6300035 on Fri Nov 14 10:48:45 MST 2025
+# SharedData Build 6298862 on Thu Nov 13 04:50:51 MST 2025
+# Start of session at: Sat Feb 28 00:06:14 2026
+# Process ID         : 202283
+# Current directory  : /home/distortionk/WorkSpace/VCS/SNN-STDP
+# Command line       : vivado -mode batch -source HW/baseline/snn_ip/vivado/build_pynq_bit_v2.tcl
+# Log file           : /home/distortionk/WorkSpace/VCS/SNN-STDP/vivado.log
+# Journal file       : /home/distortionk/WorkSpace/VCS/SNN-STDP/vivado.jou
+# Running On         : distortionk-work
+# Platform           : Ubuntu
+# Operating System   : Ubuntu 24.04.4 LTS
+# Processor Detail   : Intel(R) Core(TM) Ultra 5 125H
+# CPU Frequency      : 1994.222 MHz
+# CPU Physical cores : 14
+# CPU Logical cores  : 18
+# Host memory        : 33237 MB
+# Swap memory        : 17179 MB
+# Total Virtual      : 50417 MB
+# Available Virtual  : 40973 MB
+#-----------------------------------------------------------
+source HW/baseline/snn_ip/vivado/build_pynq_bit_v2.tcl

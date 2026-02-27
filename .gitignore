@@ -1,2 +1,29 @@
-python/SNN-baseline/datas/**
-python/SNN-baseline/dates/**
+# Datasets and runtime data
+python/SNN-baseline/datas/
+
+# Model artifacts (keep only baseline fp32 checkpoint)
+python/SNN-baseline/weights/int8/
+python/SNN-baseline/weights/**/*.pt
+!python/SNN-baseline/weights/fp32/mnist_snn_baseline.pt
+
+# Export/interop artifacts
+*.onnx
+
+# Vitis HLS generated projects/reports/logs
+HW/baseline/snn_ip/snn_top_prj*/
+HW/baseline/snn_ip/logs/
+HW/baseline/snn_ip/**/*.jou
+HW/baseline/snn_ip/**/*.log
+HW/baseline/snn_ip/**/vivado_pid*.str
+HW/baseline/snn_ip/**/webtalk*.log
+HW/baseline/snn_ip/**/hs_err_pid*.log
+
+# Vivado generated projects/outputs
+# HW/baseline/snn_ip/vivado/output_v2/
+HW/baseline/snn_ip/vivado/snn_pynq_v2/
+
+# Legacy output path
+HW/baseline/outputs/
+
+# Mid build
+__pycache__/
