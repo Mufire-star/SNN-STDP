@@ -27,3 +27,9 @@ HW/baseline/outputs/
 
 # Mid build
 __pycache__/
+.vscode
+.Xil
+
+# log
+*.log
+*.jou

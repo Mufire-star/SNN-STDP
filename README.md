@@ -14,7 +14,7 @@
 - 支持 `static / dynamic / qat` 量化模式
 - 默认量化输出目录：`python/SNN-baseline/weights/int8/`
 
-### 3) HLS 版真 SNN IP（非 ANN 代理）
+### 3) HLS 版 SNN IP
 - 路径：`HW/baseline/snn_ip/`
 - 核心文件：
 	- `snn_top.cpp` / `snn_top.h`
@@ -40,7 +40,7 @@
 ## 一键重建
 - 脚本：`./rebuild_all.sh`
 - 默认流程：数据检查 -> 训练 -> 量化 -> 权重导出 -> HLS -> Vivado
-- 可用参数：`./rebuild_all.sh --help`
+- 可用参数：`./rebuild_all.sh --help`等
 
 ## 说明
 - 当前仓库主线为 SNN 基线工程验证与硬件部署流程。
