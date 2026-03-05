@@ -10,16 +10,16 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from pynq import Overlay, allocate
+from pynq import MMIO, Overlay, allocate
 
 # 1) 配置路径
 # - `BIT_PATH` 和 `HWH_PATH`：你的 bit/hwh 文件路径
 # - `IMAGE_PATH`：要测试的灰度图路径（建议是 28x28 或可缩放到 28x28）
 
 # %%
-BIT_PATH = Path("/home/xilinx/snn/snn_v2.bit")
-HWH_PATH = Path("/home/xilinx/snn/snn_v2.hwh")
-IMAGE_PATH = Path("/home/xilinx/snn/test.png")
+BIT_PATH = Path("./snn_v2.bit")
+HWH_PATH = Path("./snn_v2.hwh")
+IMAGE_PATH = Path("./3.jpg")
 
 if not BIT_PATH.exists():
     raise FileNotFoundError(f"Bitstream not found: {BIT_PATH}")
@@ -44,7 +44,21 @@ DMA_CR_RS = 0x00000001
 DMA_CR_RESET = 0x00000004
 DMA_SR_IDLE = 0x00000002
 DMA_SR_HALTED = 0x00000001
-DMA_SR_ERR_MASK = 0x00007000
+DMA_SR_ERR_MASK = 0x00000770
+DMA_SR_IRQ_MASK = 0x00007000
+DMA_SR_ERR_BITS = {
+    0x00000010: "DMAIntErr",
+    0x00000020: "DMASlvErr",
+    0x00000040: "DMADecErr",
+    0x00000100: "SGIntErr",
+    0x00000200: "SGSlvErr",
+    0x00000400: "SGDecErr",
+}
+
+INPUT_BYTES = 28 * 28
+OUTPUT_CLASSES = 10
+OUTPUT_BYTES_16 = OUTPUT_CLASSES * 2
+OUTPUT_BYTES_32 = OUTPUT_CLASSES * 4
 
 
 # 3) 工具函数
@@ -57,18 +71,95 @@ def preprocess_image(image_path: Path) -> np.ndarray:
     return arr.reshape(-1)  # Flatten to 784 bytes
 
 
+def try_start_accelerator(ol: Overlay) -> None:
+    ip_keys = list(ol.ip_dict.keys())
+
+    candidates = []
+    for name in ip_keys:
+        low = name.lower()
+        if "dma" in low or "ps" in low or "bram" in low:
+            continue
+        candidates.append(name)
+
+    if len(candidates) == 0:
+        return
+
+    for name in candidates:
+        info = ol.ip_dict.get(name, {})
+        phys = info.get("phys_addr")
+        span = info.get("addr_range", 0x1000)
+        if phys is None:
+            continue
+        try:
+            ctrl_mmio = MMIO(phys, max(span, 0x1000))
+            ctrl = ctrl_mmio.read(0x00)
+            ctrl_mmio.write(0x00, ctrl | 0x81)
+        except Exception:
+            pass
+
+
+def run_once(dma, in_buf, out_buf, img_u8: np.ndarray, s2mm_length: int) -> np.ndarray:
+    in_buf[:] = img_u8
+    in_buf.flush()
+    out_buf[:] = 0
+    out_buf.flush()
+
+    dma.write(MM2S_DMACR, DMA_CR_RS)
+    dma.write(S2MM_DMACR, DMA_CR_RS)
+
+    dma.write(MM2S_DMASR, dma.read(MM2S_DMASR) & DMA_SR_IRQ_MASK)
+    dma.write(S2MM_DMASR, dma.read(S2MM_DMASR) & DMA_SR_IRQ_MASK)
+
+    dma.write(S2MM_DA, out_buf.device_address)
+    dma.write(S2MM_LENGTH, s2mm_length)
+
+    dma.write(MM2S_SA, in_buf.device_address)
+    dma.write(MM2S_LENGTH, INPUT_BYTES)
+
+    wait_dma_idle(dma, MM2S_DMASR, timeout_s=2.0)
+    wait_dma_idle(dma, S2MM_DMASR, timeout_s=2.0)
+
+    out_buf.invalidate()
+    return out_buf.copy()
+
+
+def init_dma_channels(dma) -> None:
+    dma.write(MM2S_DMACR, DMA_CR_RESET)
+    dma.write(S2MM_DMACR, DMA_CR_RESET)
+
+    t0 = time.perf_counter()
+    while True:
+        mm2s_cr = dma.read(MM2S_DMACR)
+        s2mm_cr = dma.read(S2MM_DMACR)
+        if ((mm2s_cr & DMA_CR_RESET) == 0) and ((s2mm_cr & DMA_CR_RESET) == 0):
+            break
+        if (time.perf_counter() - t0) > 0.01:
+            raise TimeoutError(
+                f"DMA reset timeout, MM2S_CR=0x{mm2s_cr:08X}, S2MM_CR=0x{s2mm_cr:08X}"
+            )
+
+    dma.write(MM2S_DMASR, dma.read(MM2S_DMASR) & DMA_SR_IRQ_MASK)
+    dma.write(S2MM_DMASR, dma.read(S2MM_DMASR) & DMA_SR_IRQ_MASK)
+    dma.write(MM2S_DMACR, DMA_CR_RS)
+    dma.write(S2MM_DMACR, DMA_CR_RS)
+
+
 def wait_dma_idle(dma, status_reg: int, timeout_s: float = 2.0) -> None:
     """Poll DMA status register until idle or error"""
     t0 = time.perf_counter()
     while True:
         sr = dma.read(status_reg)
         if sr & DMA_SR_ERR_MASK:
-            raise RuntimeError(f"DMA error, status=0x{sr:08X}")
+            flags = [name for bit, name in DMA_SR_ERR_BITS.items() if sr & bit]
+            raise RuntimeError(
+                f"DMA error, status=0x{sr:08X}, flags={','.join(flags) if flags else 'unknown'}"
+            )
+        if sr & DMA_SR_IRQ_MASK:
+            dma.write(status_reg, sr & DMA_SR_IRQ_MASK)
         if sr & DMA_SR_IDLE:
             return
         if (time.perf_counter() - t0) > timeout_s:
             raise TimeoutError(f"DMA timeout, status=0x{sr:08X}")
-        time.sleep(0.001)
 
 
 # ## 4) 加载 Overlay 并获取 DMA IP
@@ -79,19 +170,16 @@ if "axi_dma_0" not in ol.ip_dict:
     raise KeyError("axi_dma_0 not found in overlay")
 
 dma = ol.axi_dma_0
-print(f"DMA base address: 0x{dma.mmio.base_addr:08X}")
-print(f"DMA address range: 0x{dma.mmio.length:X}")
 
 # ## 5) 分配DDR缓冲区（使用allocate从CMA分配连续物理内存）
 
 # Input buffer: 784 bytes (28x28 image)
-in_buf = allocate(shape=(784,), dtype=np.uint8)
+in_buf = allocate(shape=(INPUT_BYTES,), dtype=np.uint8)
 
-# Output buffer: 20 bytes (10 classes * 2 bytes uint16)
-out_buf = allocate(shape=(10,), dtype=np.uint16)
+# Output buffers for protocol probing
+out_buf16 = allocate(shape=(OUTPUT_CLASSES,), dtype=np.uint16)
+out_buf32 = allocate(shape=(OUTPUT_CLASSES,), dtype=np.uint32)
 
-print(f"Input buffer physical address: 0x{in_buf.device_address:08X}")
-print(f"Output buffer physical address: 0x{out_buf.device_address:08X}")
 
 # ## 6) 单张推理 + 计时
 # 流程：
@@ -103,36 +191,34 @@ print(f"Output buffer physical address: 0x{out_buf.device_address:08X}")
 # 6) 读取输出分数
 
 img_u8 = preprocess_image(IMAGE_PATH)
-in_buf[:] = img_u8  # Copy image to DDR input buffer
-
-# Reset DMA
-dma.write(MM2S_DMACR, DMA_CR_RESET)
-dma.write(S2MM_DMACR, DMA_CR_RESET)
-time.sleep(0.01)
-
-# Start DMA channels
-dma.write(MM2S_DMACR, DMA_CR_RS)
-dma.write(S2MM_DMACR, DMA_CR_RS)
+try_start_accelerator(ol)
+init_dma_channels(dma)
 
 # Start timing
 start_t = time.perf_counter()
 
-# Configure S2MM (receive) first
-dma.write(S2MM_DA, out_buf.device_address)
-dma.write(S2MM_LENGTH, 20)  # 10 classes * 2 bytes
-
-# Configure MM2S (send) - this triggers the transfer
-dma.write(MM2S_SA, in_buf.device_address)
-dma.write(MM2S_LENGTH, 784)  # 28*28 bytes
-
-# Wait for both channels to complete
-wait_dma_idle(dma, MM2S_DMASR, timeout_s=2.0)
-wait_dma_idle(dma, S2MM_DMASR, timeout_s=2.0)
+raw16 = run_once(dma, in_buf, out_buf16, img_u8, OUTPUT_BYTES_16)
+scores = raw16.astype(np.uint16)
+decode_mode = "16-bit"
 
 elapsed_s = time.perf_counter() - start_t
 
-# Read results from output buffer
-scores = out_buf.copy()
+if np.all(scores == 0):
+    start_t = time.perf_counter()
+    raw32 = run_once(dma, in_buf, out_buf32, img_u8, OUTPUT_BYTES_32)
+    low16 = (raw32 & 0xFFFF).astype(np.uint16)
+    high16 = ((raw32 >> 16) & 0xFFFF).astype(np.uint16)
+    scores = high16 if int(np.sum(high16)) > int(np.sum(low16)) else low16
+    decode_mode = "32-bit packed"
+    elapsed_s = time.perf_counter() - start_t
+
+if np.all(scores == 0):
+    start_t = time.perf_counter()
+    raw16_inv = run_once(dma, in_buf, out_buf16, (255 - img_u8).astype(np.uint8), OUTPUT_BYTES_16)
+    scores = raw16_inv.astype(np.uint16)
+    decode_mode = "16-bit (inverted image retry)"
+    elapsed_s = time.perf_counter() - start_t
+
 pred = int(np.argmax(scores))
 
 print("\n========== Results ==========")
@@ -144,4 +230,5 @@ print("=============================\n")
 
 # ## 7) 清理资源
 in_buf.freebuffer()
-out_buf.freebuffer()
+out_buf16.freebuffer()
+out_buf32.freebuffer()
