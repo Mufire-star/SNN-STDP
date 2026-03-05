@@ -22,21 +22,42 @@ puts "Using HLS IP: $snn_vlnv"
 
 create_bd_design "design_1"
 
+# ====== 1) Configure PS: Enable M_AXI_HPM0_FPD and S_AXI_HP0_FPD ======
 create_bd_cell -type ip -vlnv xilinx.com:ip:zynq_ultra_ps_e:3.5 zynq_ultra_ps_e_0
 apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e -config {apply_board_preset "0"} [get_bd_cells zynq_ultra_ps_e_0]
 
+# Enable M_AXI_HPM0_FPD for PS to access PL peripherals (DMA/BRAM control)
+set_property -dict [list \
+    CONFIG.PSU__USE__M_AXI_GP0 {1} \
+    CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
+] [get_bd_cells zynq_ultra_ps_e_0]
+
+# Enable S_AXI_HP0_FPD for DMA to access DDR memory (KEY FIX for DMADecErr)
+set_property -dict [list \
+    CONFIG.PSU__USE__S_AXI_GP2 {1} \
+    CONFIG.PSU__SAXIGP2__DATA_WIDTH {128} \
+] [get_bd_cells zynq_ultra_ps_e_0]
+
+# ====== 2) Create all IP blocks ======
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps8_0_99M
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:7.1 axi_dma_0
 create_bd_cell -type ip -vlnv $snn_vlnv snn_top_0
-create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smartconnect_0
-create_bd_cell -type ip -vlnv xilinx.com:ip:axi_bram_ctrl:4.1 axi_bram_ctrl_0
-create_bd_cell -type ip -vlnv xilinx.com:ip:blk_mem_gen:8.4 blk_mem_gen_0
 
+# Control interconnect: PS -> DMA control registers only
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_interconnect_ctrl
 set_property -dict [list \
-    CONFIG.NUM_SI {3} \
-    CONFIG.NUM_MI {2} \
-] [get_bd_cells smartconnect_0]
+    CONFIG.NUM_SI {1} \
+    CONFIG.NUM_MI {1} \
+] [get_bd_cells axi_interconnect_ctrl]
 
+# Data interconnect: DMA -> PS DDR (KEY FIX for DMADecErr)
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_interconnect_data
+set_property -dict [list \
+    CONFIG.NUM_SI {2} \
+    CONFIG.NUM_MI {1} \
+] [get_bd_cells axi_interconnect_data]
+
+# ====== 3) Configure DMA ======
 set_property -dict [list \
     CONFIG.c_include_sg {0} \
     CONFIG.c_sg_length_width {26} \
@@ -44,52 +65,94 @@ set_property -dict [list \
     CONFIG.c_s2mm_burst_size {16} \
     CONFIG.c_m_axis_mm2s_tdata_width {8} \
     CONFIG.c_s_axis_s2mm_tdata_width {16} \
+    CONFIG.c_m_axi_mm2s_data_width {64} \
+    CONFIG.c_m_axi_s2mm_data_width {64} \
 ] [get_bd_cells axi_dma_0]
 
-# 256 KB BRAM for DMA source/sink buffers
-set_property -dict [list \
-    CONFIG.Memory_Type {True_Dual_Port_RAM} \
-    CONFIG.Use_Byte_Write_Enable {true} \
-    CONFIG.Byte_Size {8} \
-    CONFIG.Write_Width_A {32} \
-    CONFIG.Read_Width_A {32} \
-    CONFIG.Write_Depth_A {65536} \
-    CONFIG.Write_Width_B {32} \
-    CONFIG.Read_Width_B {32} \
-] [get_bd_cells blk_mem_gen_0]
-
-# Clock/reset
+# ====== 4) Connect clocks and resets ======
 connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk0] [get_bd_pins rst_ps8_0_99M/slowest_sync_clk]
 connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_resetn0] [get_bd_pins rst_ps8_0_99M/ext_reset_in]
 
-foreach p {zynq_ultra_ps_e_0/maxihpm0_lpd_aclk smartconnect_0/aclk axi_dma_0/s_axi_lite_aclk axi_dma_0/m_axi_mm2s_aclk axi_dma_0/m_axi_s2mm_aclk axi_bram_ctrl_0/s_axi_aclk snn_top_0/ap_clk} {
+# Connect all IP clocks to pl_clk0 (100MHz)
+foreach p { \
+    zynq_ultra_ps_e_0/maxihpm0_fpd_aclk \
+    zynq_ultra_ps_e_0/maxihpm0_lpd_aclk \
+    zynq_ultra_ps_e_0/saxihp0_fpd_aclk \
+    axi_interconnect_ctrl/ACLK \
+    axi_interconnect_ctrl/S00_ACLK \
+    axi_interconnect_ctrl/M00_ACLK \
+    axi_interconnect_data/ACLK \
+    axi_interconnect_data/S00_ACLK \
+    axi_interconnect_data/S01_ACLK \
+    axi_interconnect_data/M00_ACLK \
+    axi_dma_0/s_axi_lite_aclk \
+    axi_dma_0/m_axi_mm2s_aclk \
+    axi_dma_0/m_axi_s2mm_aclk \
+    snn_top_0/ap_clk \
+} {
     connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk0] [get_bd_pins $p]
 }
 
-foreach p {smartconnect_0/aresetn axi_dma_0/axi_resetn axi_bram_ctrl_0/s_axi_aresetn snn_top_0/ap_rst_n} {
+# Connect peripheral resets
+foreach p { \
+    axi_interconnect_ctrl/ARESETN \
+    axi_interconnect_ctrl/S00_ARESETN \
+    axi_interconnect_ctrl/M00_ARESETN \
+    axi_interconnect_data/ARESETN \
+    axi_interconnect_data/S00_ARESETN \
+    axi_interconnect_data/S01_ARESETN \
+    axi_interconnect_data/M00_ARESETN \
+    axi_dma_0/axi_resetn \
+    snn_top_0/ap_rst_n \
+} {
     connect_bd_net [get_bd_pins rst_ps8_0_99M/peripheral_aresetn] [get_bd_pins $p]
 }
 
-# Keep SNN running: ap_start tied high
+# ====== 5) Keep SNN always running ======
 create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_ap_start
 set_property -dict [list CONFIG.CONST_WIDTH {1} CONFIG.CONST_VAL {1}] [get_bd_cells const_ap_start]
 connect_bd_net [get_bd_pins const_ap_start/dout] [get_bd_pins snn_top_0/ap_start]
 
-# AXI memory-mapped fabric
-connect_bd_intf_net [get_bd_intf_pins zynq_ultra_ps_e_0/M_AXI_HPM0_LPD] [get_bd_intf_pins smartconnect_0/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_MM2S] [get_bd_intf_pins smartconnect_0/S01_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM] [get_bd_intf_pins smartconnect_0/S02_AXI]
-connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M00_AXI] [get_bd_intf_pins axi_bram_ctrl_0/S_AXI]
-connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M01_AXI] [get_bd_intf_pins axi_dma_0/S_AXI_LITE]
+# ====== 6) AXI Control Path: PS -> DMA ======
+# PS M_AXI_HPM0_FPD -> interconnect -> DMA S_AXI_LITE
+connect_bd_intf_net [get_bd_intf_pins zynq_ultra_ps_e_0/M_AXI_HPM0_FPD] \
+                    [get_bd_intf_pins axi_interconnect_ctrl/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_interconnect_ctrl/M00_AXI] \
+                    [get_bd_intf_pins axi_dma_0/S_AXI_LITE]
 
-# BRAM connection
-connect_bd_intf_net [get_bd_intf_pins axi_bram_ctrl_0/BRAM_PORTA] [get_bd_intf_pins blk_mem_gen_0/BRAM_PORTA]
+# ====== 7) AXI Data Path: DMA -> PS DDR (KEY FIX for DMADecErr) ======
+# DMA M_AXI_MM2S/S2MM -> interconnect -> PS S_AXI_HP0_FPD
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_MM2S] \
+                    [get_bd_intf_pins axi_interconnect_data/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM] \
+                    [get_bd_intf_pins axi_interconnect_data/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_interconnect_data/M00_AXI] \
+                    [get_bd_intf_pins zynq_ultra_ps_e_0/S_AXI_HP0_FPD]
 
-# AXI Stream path
-connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXIS_MM2S] [get_bd_intf_pins snn_top_0/in_stream]
-connect_bd_intf_net [get_bd_intf_pins snn_top_0/out_stream] [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM]
+# ====== 8) AXI Stream: DMA <-> SNN ======
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXIS_MM2S] \
+                    [get_bd_intf_pins snn_top_0/in_stream]
+connect_bd_intf_net [get_bd_intf_pins snn_top_0/out_stream] \
+                    [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM]
 
+# ====== 9) Address assignment and validation ======
 assign_bd_address
+
+# Verify critical address mappings:
+# - zynq_ultra_ps_e_0/Data(M_AXI_HPM0_FPD) should see:
+#   * axi_dma_0/S_AXI_LITE (typically 0x8000_0000 range)
+# - axi_dma_0/Data_MM2S(M_AXI_MM2S) should see:
+#   * zynq_ultra_ps_e_0/SAXIGP2 (0x0000_0000 - DDR memory)
+# - axi_dma_0/Data_S2MM(M_AXI_S2MM) should see:
+#   * zynq_ultra_ps_e_0/SAXIGP2 (0x0000_0000 - DDR memory)
+
+puts "\n========== Address Map =========="
+puts "Check Address Editor in Vivado GUI to verify:"
+puts "1. PS M_AXI_HPM0_FPD can access DMA @ 0x8000_0000"
+puts "2. DMA M_AXI_MM2S can access DDR @ 0x0000_0000 - 0x7FFF_FFFF"
+puts "3. DMA M_AXI_S2MM can access DDR @ 0x0000_0000 - 0x7FFF_FFFF"
+puts "=================================\n"
+
 validate_bd_design
 save_bd_design
 
