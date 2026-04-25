@@ -533,15 +533,19 @@ init_fc:
                     }
                 }
             stdp_conv2_ltd:
-                for (int ic = 0; ic < C1; ic++)
+                for (int oc = 0; oc < C2; oc++)
                 {
                     for (int i = 0; i < P1_H; i++)
                     {
                         for (int j = 0; j < P1_W; j++)
                         {
-                            if (!p1[ic][i][j])
+                            if (last_post_conv2[oc][i][j] == TS_NONE)
                                 continue;
-                            for (int oc = 0; oc < C2; oc++)
+                            int dt = t - int(last_post_conv2[oc][i][j]);
+                            if (dt <= 0 || dt >= T_STEPS || spk2[oc][i][j])
+                                continue;
+
+                            for (int ic = 0; ic < C1; ic++)
                             {
                                 for (int ki = 0; ki < K; ki++)
                                 {
@@ -549,17 +553,11 @@ init_fc:
                                     {
                                         int ii = i + ki - 1;
                                         int jj = j + kj - 1;
-                                        if (ii >= 0 && ii < P1_H && jj >= 0 && jj < P1_W)
+                                        if (ii >= 0 && ii < P1_H && jj >= 0 && jj < P1_W && p1[ic][ii][jj])
                                         {
-                                            if (last_post_conv2[oc][ii][jj] == TS_NONE)
-                                                continue;
-                                            int dt = t - int(last_post_conv2[oc][ii][jj]);
-                                            if (dt > 0 && dt < T_STEPS && !spk2[oc][ii][jj])
-                                            {
-                                                int widx = idx_conv2(oc, ic, ki, kj);
-                                                dw_t dw = stdp_ltd(dt);
-                                                rw_conv2_w[widx] = clamp_w(rw_conv2_w[widx] - w_t(dw));
-                                            }
+                                            int widx = idx_conv2(oc, ic, ki, kj);
+                                            dw_t dw = stdp_ltd(dt);
+                                            rw_conv2_w[widx] = clamp_w(rw_conv2_w[widx] - w_t(dw));
                                         }
                                     }
                                 }
