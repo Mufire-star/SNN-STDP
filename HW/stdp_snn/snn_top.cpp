@@ -63,12 +63,12 @@ static inline w_t init_conv2_weight(int idx)
     const int bucket = (idx * 13 + 5) % 6;
     switch (bucket)
     {
-    case 0: return w_t(0.010);
-    case 1: return w_t(0.015);
-    case 2: return w_t(0.020);
-    case 3: return w_t(0.025);
-    case 4: return w_t(0.030);
-    default: return w_t(0.035);
+    case 0: return w_t(0.030);
+    case 1: return w_t(0.040);
+    case 2: return w_t(0.050);
+    case 3: return w_t(0.060);
+    case 4: return w_t(0.070);
+    default: return w_t(0.080);
     }
 }
 
@@ -78,11 +78,11 @@ static inline w_t init_fc_weight(int idx)
     const int bucket = (idx * 17 + 3) % 5;
     switch (bucket)
     {
-    case 0: return w_t(0.004);
-    case 1: return w_t(0.006);
-    case 2: return w_t(0.008);
-    case 3: return w_t(0.010);
-    default: return w_t(0.012);
+    case 0: return w_t(0.040);
+    case 1: return w_t(0.055);
+    case 2: return w_t(0.070);
+    case 3: return w_t(0.085);
+    default: return w_t(0.100);
     }
 }
 
@@ -95,13 +95,13 @@ static inline w_t conv1_bias(int)
 static inline w_t conv2_bias(int)
 {
 #pragma HLS INLINE
-    return w_t(0.02);
+    return w_t(0.06);
 }
 
 static inline w_t fc_bias(int)
 {
 #pragma HLS INLINE
-    return w_t(0.0);
+    return w_t(0.12);
 }
 
 static inline dw_t stdp_ltp(int dt)
@@ -207,8 +207,8 @@ init_fc:
 #pragma HLS BIND_STORAGE variable = last_pre_fc type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_post_fc type = ram_1p impl = bram
 
-    const mem_t v_th = mem_t(0.5);
-    const mem_t alpha = mem_t(0.5);
+    const mem_t v_th = mem_t(0.35);
+    const mem_t alpha = mem_t(0.6);
 
     if (mode == MODE_TRAIN)
     {

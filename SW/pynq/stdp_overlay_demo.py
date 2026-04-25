@@ -233,6 +233,15 @@ def topk_pairs(scores: np.ndarray, topk: int = 3) -> list[tuple[int, int]]:
     return [(int(idx), int(scores[idx])) for idx in order]
 
 
+def validate_scores(scores: np.ndarray, context: str) -> None:
+    if scores.shape != (OUTPUT_CLASSES,):
+        raise RuntimeError(f"{context}: invalid score shape {scores.shape}, expected {(OUTPUT_CLASSES,)}")
+    if np.all(scores == 0):
+        raise RuntimeError(
+            f"{context}: accelerator returned all-zero scores; this is not a valid prediction"
+        )
+
+
 def run_mode(
     dma,
     allocate_fn,
@@ -273,6 +282,7 @@ def print_result_block(
     repeat: int,
     consistent: bool,
 ) -> None:
+    validate_scores(scores, title)
     pred = int(np.argmax(scores))
     print(f"{title}:")
     print(f"  scores = {scores.astype(np.uint16).tolist()}")
@@ -384,6 +394,7 @@ def main() -> int:
             repeat=args.repeat,
             timeout_s=args.timeout_s,
         )
+        validate_scores(infer_scores, "Infer-only")
         print_result_block("Infer-only", infer_scores, infer_ms, args.repeat, infer_consistent)
         results["infer"] = {
             "scores": infer_scores.astype(np.uint16).tolist(),
@@ -405,6 +416,7 @@ def main() -> int:
             repeat=args.repeat,
             timeout_s=args.timeout_s,
         )
+        validate_scores(train_scores, "Train-then-infer")
         print_result_block("Train-then-infer", train_scores, train_ms, args.repeat, train_consistent)
         results["train_then_infer"] = {
             "scores": train_scores.astype(np.uint16).tolist(),

@@ -19,7 +19,7 @@ constexpr int P2_H = 7;
 constexpr int P2_W = 7;
 constexpr int FC_IN = C2 * P2_H * P2_W;
 constexpr int FC_OUT = 10;
-constexpr int T_STEPS = 4;
+constexpr int T_STEPS = 8;
 
 constexpr int CONV1_W_SIZE = C1 * 1 * K * K;
 constexpr int CONV2_W_SIZE = C2 * C1 * K * K;
@@ -32,12 +32,14 @@ constexpr int MODE_INFER = 0;
 constexpr int MODE_TRAIN = 1;
 
 typedef ap_uint<8> pix_t;
-typedef ap_fixed<8, 4> w_t;
-typedef ap_fixed<16, 8> acc_t;
+// Keep enough fractional precision so the small deterministic bootstrap
+// weights used by the STDP demo do not quantize to zero after HLS lowering.
+typedef ap_fixed<12, 4> w_t;
+typedef ap_fixed<20, 8> acc_t;
 typedef ap_fixed<16, 8> mem_t;
-typedef ap_ufixed<8, 2> dw_t;
-typedef ap_uint<3> ts_t;
-typedef ap_uint<3> spike_cnt_t;
+typedef ap_ufixed<12, 2> dw_t;
+typedef ap_uint<4> ts_t;
+typedef ap_uint<5> spike_cnt_t;
 
 constexpr int STDP_TAU_PLUS = 4;
 constexpr int STDP_TAU_MINUS = 4;
@@ -45,7 +47,7 @@ const dw_t STDP_A_PLUS = dw_t(0.01);
 const dw_t STDP_A_MINUS = dw_t(0.012);
 const w_t W_MAX = w_t(3.0);
 const w_t W_MIN = w_t(-3.0);
-const ts_t TS_NONE = ts_t((1 << 3) - 1);
+const ts_t TS_NONE = ts_t((1 << 4) - 1);
 
 typedef ap_axiu<8, 0, 0, 0> axis_in_t;
 typedef ap_axiu<16, 0, 0, 0> axis_out_t;
