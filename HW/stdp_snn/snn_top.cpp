@@ -35,25 +35,28 @@ static inline w_t clamp_w(w_t w)
     return w;
 }
 
-// Use deterministic small positive initial weights so the project is
-// self-contained and does not depend on an external supervised checkpoint.
+// Use deterministic bootstrap weights so the project is self-contained and
+// does not depend on an external supervised checkpoint. The convolutional
+// layers still adapt with unsupervised STDP during MODE_TRAIN; the FC layer
+// starts mildly inhibitory so label-gated STDP can bind support samples to the
+// matching output neurons.
 static inline w_t init_conv1_weight(int idx)
 {
 #pragma HLS INLINE
     const int bucket = (idx * 11 + 7) % 11;
     switch (bucket)
     {
-    case 0: return w_t(0.08);
-    case 1: return w_t(0.09);
-    case 2: return w_t(0.10);
-    case 3: return w_t(0.11);
-    case 4: return w_t(0.12);
-    case 5: return w_t(0.13);
-    case 6: return w_t(0.14);
-    case 7: return w_t(0.15);
-    case 8: return w_t(0.16);
-    case 9: return w_t(0.17);
-    default: return w_t(0.18);
+    case 0: return w_t(0.035);
+    case 1: return w_t(0.039);
+    case 2: return w_t(0.043);
+    case 3: return w_t(0.047);
+    case 4: return w_t(0.051);
+    case 5: return w_t(0.055);
+    case 6: return w_t(0.059);
+    case 7: return w_t(0.063);
+    case 8: return w_t(0.067);
+    case 9: return w_t(0.071);
+    default: return w_t(0.075);
     }
 }
 
@@ -63,45 +66,58 @@ static inline w_t init_conv2_weight(int idx)
     const int bucket = (idx * 13 + 5) % 6;
     switch (bucket)
     {
-    case 0: return w_t(0.030);
-    case 1: return w_t(0.040);
-    case 2: return w_t(0.050);
-    case 3: return w_t(0.060);
-    case 4: return w_t(0.070);
-    default: return w_t(0.080);
+    case 0: return w_t(0.020);
+    case 1: return w_t(0.027);
+    case 2: return w_t(0.034);
+    case 3: return w_t(0.041);
+    case 4: return w_t(0.048);
+    default: return w_t(0.055);
     }
 }
 
 static inline w_t init_fc_weight(int idx)
 {
 #pragma HLS INLINE
-    const int bucket = (idx * 17 + 3) % 5;
+    const int bucket = (idx * 7 + 3) % 5;
     switch (bucket)
     {
-    case 0: return w_t(0.040);
-    case 1: return w_t(0.055);
-    case 2: return w_t(0.070);
-    case 3: return w_t(0.085);
-    default: return w_t(0.100);
+    case 0: return w_t(-0.050);
+    case 1: return w_t(-0.046);
+    case 2: return w_t(-0.042);
+    case 3: return w_t(-0.038);
+    default: return w_t(-0.034);
     }
 }
 
 static inline w_t conv1_bias(int)
 {
 #pragma HLS INLINE
-    return w_t(0.05);
+    return w_t(0.0);
 }
 
 static inline w_t conv2_bias(int)
 {
 #pragma HLS INLINE
-    return w_t(0.06);
+    return w_t(0.0);
 }
 
 static inline w_t fc_bias(int)
 {
 #pragma HLS INLINE
-    return w_t(0.12);
+    return w_t(0.0);
+}
+
+static inline w_t fc_label_ltp(int dt)
+{
+#pragma HLS INLINE
+    switch (dt)
+    {
+    case 0: return w_t(0.070);
+    case 1: return w_t(0.055);
+    case 2: return w_t(0.040);
+    case 3: return w_t(0.030);
+    default: return w_t(0.020);
+    }
 }
 
 static inline dw_t stdp_ltp(int dt)
@@ -181,6 +197,7 @@ init_fc:
     ap_uint<1> spk2[C2][P1_H][P1_W];
     ap_uint<1> p2[C2][P2_H][P2_W];
     mem_t mem3[FC_OUT];
+    mem_t fc_next[FC_OUT];
     ap_uint<1> spk3[FC_OUT];
     spike_cnt_t spike_cnt[FC_OUT];
     ts_t last_pre_conv1[IMG_H][IMG_W];
@@ -208,6 +225,7 @@ init_fc:
 #pragma HLS BIND_STORAGE variable = last_post_fc type = ram_1p impl = bram
 
     const mem_t v_th = mem_t(0.35);
+    const mem_t fc_v_th = mem_t(0.12);
     const mem_t alpha = mem_t(0.6);
 
     if (mode == MODE_TRAIN)
@@ -278,6 +296,11 @@ init_fc:
         reset_ts_fc_post:
             for (int o = 0; o < FC_OUT; o++)
                 last_post_fc[o] = TS_NONE;
+
+            axis_in_t label_p = in_stream.read();
+            ap_uint<4> train_label = label_p.data.range(3, 0);
+            if (train_label >= FC_OUT)
+                train_label = 0;
 
         load_train_img:
             for (int i = 0; i < IMG_H; i++)
@@ -352,6 +375,9 @@ init_fc:
                     }
                 }
 
+            const bool enable_conv_stdp = true;
+            if (enable_conv_stdp)
+            {
             stdp_conv1_ltp:
                 for (int oc = 0; oc < C1; oc++)
                 {
@@ -389,38 +415,7 @@ init_fc:
                         }
                     }
                 }
-            stdp_conv1_ltd:
-                for (int i = 0; i < IMG_H; i++)
-                {
-                    for (int j = 0; j < IMG_W; j++)
-                    {
-                        if (!in_spk[i][j])
-                            continue;
-                        for (int oc = 0; oc < C1; oc++)
-                        {
-                            if (last_post_conv1[oc][i][j] == TS_NONE)
-                                continue;
-                            int dt = t - int(last_post_conv1[oc][i][j]);
-                            if (dt > 0 && dt < T_STEPS && !spk1[oc][i][j])
-                            {
-                                for (int ki = 0; ki < K; ki++)
-                                {
-                                    for (int kj = 0; kj < K; kj++)
-                                    {
-                                        int ii = i + ki - 1;
-                                        int jj = j + kj - 1;
-                                        if (ii >= 0 && ii < IMG_H && jj >= 0 && jj < IMG_W)
-                                        {
-                                            int widx = idx_conv1(oc, ki, kj);
-                                            dw_t dw = stdp_ltd(dt);
-                                            rw_conv1_w[widx] = clamp_w(rw_conv1_w[widx] - w_t(dw));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            }
 
             pool1_train:
                 for (int oc = 0; oc < C1; oc++)
@@ -492,6 +487,8 @@ init_fc:
                     }
                 }
 
+            if (enable_conv_stdp)
+            {
             stdp_conv2_ltp:
                 for (int oc = 0; oc < C2; oc++)
                 {
@@ -532,39 +529,7 @@ init_fc:
                         }
                     }
                 }
-            stdp_conv2_ltd:
-                for (int oc = 0; oc < C2; oc++)
-                {
-                    for (int i = 0; i < P1_H; i++)
-                    {
-                        for (int j = 0; j < P1_W; j++)
-                        {
-                            if (last_post_conv2[oc][i][j] == TS_NONE)
-                                continue;
-                            int dt = t - int(last_post_conv2[oc][i][j]);
-                            if (dt <= 0 || dt >= T_STEPS || spk2[oc][i][j])
-                                continue;
-
-                            for (int ic = 0; ic < C1; ic++)
-                            {
-                                for (int ki = 0; ki < K; ki++)
-                                {
-                                    for (int kj = 0; kj < K; kj++)
-                                    {
-                                        int ii = i + ki - 1;
-                                        int jj = j + kj - 1;
-                                        if (ii >= 0 && ii < P1_H && jj >= 0 && jj < P1_W && p1[ic][ii][jj])
-                                        {
-                                            int widx = idx_conv2(oc, ic, ki, kj);
-                                            dw_t dw = stdp_ltd(dt);
-                                            rw_conv2_w[widx] = clamp_w(rw_conv2_w[widx] - w_t(dw));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            }
 
             pool2_train:
                 for (int oc = 0; oc < C2; oc++)
@@ -586,6 +551,8 @@ init_fc:
                     }
                 }
 
+                ap_uint<1> any_fc_pre = ap_uint<1>(0);
+
             update_pre_fc:
                 for (int oc = 0; oc < C2; oc++)
                 {
@@ -595,12 +562,18 @@ init_fc:
                         {
 #pragma HLS PIPELINE II = 1
                             if (p2[oc][i][j])
+                            {
                                 last_pre_fc[oc][i][j] = ts_t(t);
+                                any_fc_pre = ap_uint<1>(1);
+                            }
                         }
                     }
                 }
 
-            fc_lif_train:
+                int fc_winner = -1;
+                mem_t fc_best = mem_t(-128);
+
+            fc_lif_train_eval:
                 for (int o = 0; o < FC_OUT; o++)
                 {
                     acc_t sum = fc_bias(o);
@@ -619,8 +592,20 @@ init_fc:
                         }
                     }
                     mem_t m = mem3[o] + alpha * (mem_t(sum) - mem3[o]);
-                    ap_uint<1> s = (m >= v_th) ? ap_uint<1>(1) : ap_uint<1>(0);
-                    mem3[o] = s ? mem_t(m - v_th) : mem_t(m);
+                    fc_next[o] = m;
+                    if (m >= fc_v_th && (fc_winner < 0 || m > fc_best))
+                    {
+                        fc_best = m;
+                        fc_winner = o;
+                    }
+                }
+
+            fc_lif_train_commit:
+                for (int o = 0; o < FC_OUT; o++)
+                {
+#pragma HLS PIPELINE II = 1
+                    ap_uint<1> s = (any_fc_pre && o == int(train_label)) ? ap_uint<1>(1) : ap_uint<1>(0);
+                    mem3[o] = s ? mem_t(fc_next[o] - fc_v_th) : mem_t(fc_next[o]);
                     spk3[o] = s;
                     spike_cnt[o] += s;
                     if (s)
@@ -642,15 +627,14 @@ init_fc:
                                 int widx = idx_fc(o, idx);
                                 if (p2[oc][i][j])
                                 {
-                                    rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + w_t(STDP_A_PLUS));
+                                    rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + fc_label_ltp(0));
                                 }
                                 else if (last_pre_fc[oc][i][j] != TS_NONE)
                                 {
                                     int dt = t - int(last_pre_fc[oc][i][j]);
                                     if (dt > 0 && dt < T_STEPS)
                                     {
-                                        dw_t dw = stdp_ltp(dt);
-                                        rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + w_t(dw));
+                                        rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + fc_label_ltp(dt));
                                     }
                                 }
                             }
@@ -668,13 +652,18 @@ init_fc:
                                 continue;
                             for (int o = 0; o < FC_OUT; o++)
                             {
+                                const int idx = ((oc * P2_H + i) * P2_W + j);
+                                int widx = idx_fc(o, idx);
+                                if (o != int(train_label))
+                                {
+                                    rw_fc_w[widx] = clamp_w(rw_fc_w[widx] - w_t(0.004));
+                                    continue;
+                                }
                                 if (last_post_fc[o] == TS_NONE)
                                     continue;
                                 int dt = t - int(last_post_fc[o]);
                                 if (dt > 0 && dt < T_STEPS && !spk3[o])
                                 {
-                                    const int idx = ((oc * P2_H + i) * P2_W + j);
-                                    int widx = idx_fc(o, idx);
                                     dw_t dw = stdp_ltd(dt);
                                     rw_fc_w[widx] = clamp_w(rw_fc_w[widx] - w_t(dw));
                                 }
@@ -857,7 +846,10 @@ infer_reset_fc:
                 }
             }
 
-        fc_lif_infer:
+            int fc_winner = -1;
+            mem_t fc_best = mem_t(-128);
+
+        fc_lif_infer_eval:
             for (int o = 0; o < FC_OUT; o++)
             {
                 acc_t sum = fc_bias(o);
@@ -876,8 +868,20 @@ infer_reset_fc:
                     }
                 }
                 mem_t m = mem3[o] + alpha * (mem_t(sum) - mem3[o]);
-                ap_uint<1> s = (m >= v_th) ? ap_uint<1>(1) : ap_uint<1>(0);
-                mem3[o] = s ? mem_t(m - v_th) : mem_t(m);
+                fc_next[o] = m;
+                if (m >= fc_v_th && (fc_winner < 0 || m > fc_best))
+                {
+                    fc_best = m;
+                    fc_winner = o;
+                }
+            }
+
+        fc_lif_infer_commit:
+            for (int o = 0; o < FC_OUT; o++)
+            {
+#pragma HLS PIPELINE II = 1
+                ap_uint<1> s = (o == fc_winner) ? ap_uint<1>(1) : ap_uint<1>(0);
+                mem3[o] = s ? mem_t(fc_next[o] - fc_v_th) : mem_t(fc_next[o]);
                 spk3[o] = s;
                 spike_cnt[o] += s;
             }

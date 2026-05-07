@@ -11,6 +11,9 @@ __pycache__/
 *.log
 *.jou
 .Xil/
+_ide/
+*.err
+*.out
 
 # Editor / local tooling
 .vscode/

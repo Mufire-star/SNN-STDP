@@ -25,8 +25,9 @@ constexpr int CONV1_W_SIZE = C1 * 1 * K * K;
 constexpr int CONV2_W_SIZE = C2 * C1 * K * K;
 constexpr int FC_W_SIZE = FC_OUT * FC_IN;
 
-// MODE_TRAIN 下紧跟在模式字节后的训练图数量。
-constexpr int NUM_TRAIN_IMG = 4;
+// MODE_TRAIN receives NUM_TRAIN_IMG support samples. Each sample is encoded as
+// one label byte followed by one 28x28 image.
+constexpr int NUM_TRAIN_IMG = 10;
 
 constexpr int MODE_INFER = 0;
 constexpr int MODE_TRAIN = 1;

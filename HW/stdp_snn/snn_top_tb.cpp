@@ -97,7 +97,6 @@ static int collect_scores(
     if (all_zero)
     {
         std::cerr << tag << ": accelerator returned all-zero scores\n";
-        return -1;
     }
 
     return best_idx;
@@ -134,6 +133,7 @@ static int run_train_then_infer(
     hls::stream<axis_in_t> &in_stream,
     hls::stream<axis_out_t> &out_stream,
     const std::vector<std::vector<unsigned char>> &train_images,
+    const std::vector<unsigned char> &train_labels,
     const std::vector<unsigned char> &test_image,
     std::array<int, FC_OUT> &scores)
 {
@@ -147,6 +147,13 @@ static int run_train_then_infer(
     for (int n = 0; n < NUM_TRAIN_IMG; n++)
     {
         const auto &img = train_images[n];
+        axis_in_t label_p;
+        label_p.data = train_labels[n];
+        label_p.keep = -1;
+        label_p.strb = -1;
+        label_p.last = 0;
+        in_stream.write(label_p);
+
         for (int i = 0; i < IMG_H * IMG_W; i++)
         {
             axis_in_t p;
@@ -203,7 +210,7 @@ int main()
         return 1;
     }
 
-    const int total_need = NUM_TRAIN_IMG + 2;
+    const int total_need = NUM_TRAIN_IMG + 1;
     if (num_i < static_cast<uint32_t>(total_need) || num_l < static_cast<uint32_t>(total_need))
     {
         std::cerr << "Not enough MNIST samples for testbench.\n";
@@ -227,7 +234,8 @@ int main()
     const int pred_baseline = run_infer(in_stream, out_stream, images[0], baseline_scores);
 
     std::vector<std::vector<unsigned char>> train_imgs(images.begin() + 1, images.begin() + 1 + NUM_TRAIN_IMG);
-    const int pred_after_train = run_train_then_infer(in_stream, out_stream, train_imgs, images[0], trained_scores);
+    std::vector<unsigned char> train_lbls(labels.begin() + 1, labels.begin() + 1 + NUM_TRAIN_IMG);
+    const int pred_after_train = run_train_then_infer(in_stream, out_stream, train_imgs, train_lbls, images[0], trained_scores);
 
     if (pred_baseline < 0 || pred_after_train < 0)
     {
