@@ -17,6 +17,36 @@ OUTPUT_BYTES = OUTPUT_CLASSES * 2
 NUM_TRAIN_IMG = 10
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 DEFAULT_GAINS = (1.0, 0.75, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08)
+MNIST_SPLIT_FILES = {
+    "train": ("train-images-idx3-ubyte", "train-labels-idx1-ubyte"),
+    "test": ("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte"),
+}
+
+# Notebook-friendly defaults. When this file is run in Jupyter with no extra
+# arguments, these values are converted into the equivalent CLI options.
+NOTEBOOK_AUTO_CONFIG = True
+NOTEBOOK_USE_DATASET = True
+NOTEBOOK_RAW_DIR = "mnist_raw"
+NOTEBOOK_MODE = "train"
+NOTEBOOK_BATCH = True
+NOTEBOOK_TRAIN_SPLIT = "train"
+NOTEBOOK_TEST_SPLIT = "test"
+NOTEBOOK_TRAIN_LABEL: int | None = None
+NOTEBOOK_TEST_LABEL = 2
+NOTEBOOK_TRAIN_COUNT = 4
+NOTEBOOK_TRAIN_OFFSET = 0
+NOTEBOOK_TEST_INDEX = 0
+NOTEBOOK_TEST_COUNT = 100
+NOTEBOOK_TEST_OFFSET = 0
+NOTEBOOK_GAIN: float | None = None
+NOTEBOOK_BIT: str | None = None
+NOTEBOOK_IMAGE: str | None = None
+NOTEBOOK_BATCH_DIR: str | None = None
+NOTEBOOK_INVERT = False
+NOTEBOOK_RAW_RESIZE = False
+NOTEBOOK_NO_AUTO_INVERT = False
+NOTEBOOK_NO_AUTO_GAIN = False
+NOTEBOOK_SHOW_PIXELS = False
 
 MM2S_DMACR = 0x00
 MM2S_DMASR = 0x04
@@ -77,6 +107,19 @@ def default_image_candidates() -> list[Path]:
     return unique_paths(candidates)
 
 
+def default_raw_dir_candidates() -> list[Path]:
+    root = repo_root()
+    return unique_paths(
+        [
+            Path.cwd() / "mnist_raw",
+            script_dir() / "mnist_raw",
+            Path.cwd() / "data/mnist/raw",
+            script_dir() / "data/mnist/raw",
+            root / "data/mnist/raw",
+        ]
+    )
+
+
 def unique_paths(paths: list[Path]) -> list[Path]:
     seen: set[Path] = set()
     unique: list[Path] = []
@@ -131,6 +174,10 @@ def resolve_image_path(path: Path | None) -> Path:
     return resolve_existing_path(None, default_image_candidates(), "input image")
 
 
+def resolve_raw_dir(path: Path | None) -> Path:
+    return resolve_existing_path(path, default_raw_dir_candidates(), "MNIST raw directory")
+
+
 def resolve_batch_image_paths(directory: Path) -> list[Path]:
     if not directory.exists() or not directory.is_dir():
         raise FileNotFoundError(f"batch directory not found: {directory}")
@@ -157,6 +204,53 @@ def resolve_default_batch_dir() -> Path | None:
         except FileNotFoundError:
             continue
     return None
+
+
+def notebook_default_argv() -> list[str]:
+    argv: list[str] = []
+
+    if NOTEBOOK_BIT:
+        argv.extend(["--bit", NOTEBOOK_BIT])
+
+    if NOTEBOOK_USE_DATASET:
+        argv.append("--dataset")
+        if NOTEBOOK_RAW_DIR:
+            argv.extend(["--raw-dir", NOTEBOOK_RAW_DIR])
+        argv.extend(["--mode", NOTEBOOK_MODE])
+        argv.extend(["--train-split", NOTEBOOK_TRAIN_SPLIT])
+        argv.extend(["--test-split", NOTEBOOK_TEST_SPLIT])
+        argv.extend(["--test-label", str(NOTEBOOK_TEST_LABEL)])
+        argv.extend(["--train-count", str(NOTEBOOK_TRAIN_COUNT)])
+        argv.extend(["--train-offset", str(NOTEBOOK_TRAIN_OFFSET)])
+        argv.extend(["--test-index", str(NOTEBOOK_TEST_INDEX)])
+        argv.extend(["--test-count", str(NOTEBOOK_TEST_COUNT)])
+        argv.extend(["--test-offset", str(NOTEBOOK_TEST_OFFSET)])
+        if NOTEBOOK_TRAIN_LABEL is not None:
+            argv.extend(["--train-label", str(NOTEBOOK_TRAIN_LABEL)])
+        if NOTEBOOK_BATCH or NOTEBOOK_TEST_COUNT > 1:
+            argv.append("--batch")
+    else:
+        if NOTEBOOK_IMAGE:
+            argv.append(NOTEBOOK_IMAGE)
+        if NOTEBOOK_BATCH:
+            argv.append("--batch")
+        if NOTEBOOK_BATCH_DIR:
+            argv.extend(["--batch-dir", NOTEBOOK_BATCH_DIR])
+
+    if NOTEBOOK_GAIN is not None:
+        argv.extend(["--gain", str(NOTEBOOK_GAIN)])
+    if NOTEBOOK_INVERT:
+        argv.append("--invert")
+    if NOTEBOOK_RAW_RESIZE:
+        argv.append("--raw-resize")
+    if NOTEBOOK_NO_AUTO_INVERT:
+        argv.append("--no-auto-invert")
+    if NOTEBOOK_NO_AUTO_GAIN:
+        argv.append("--no-auto-gain")
+    if NOTEBOOK_SHOW_PIXELS:
+        argv.append("--show-pixels")
+
+    return argv
 
 
 def label_from_filename(path: Path) -> int | None:
@@ -192,8 +286,191 @@ def resolve_support_paths(image_path: Path, support_dir: Path | None) -> list[tu
     return [(label, by_label[label]) for label in range(NUM_TRAIN_IMG)]
 
 
+_MNIST_CACHE: dict[tuple[str, str], tuple[object, object]] = {}
+
+
+def load_mnist_images(path: Path):
+    import numpy as np
+
+    data = path.read_bytes()
+    if len(data) < 16:
+        raise ValueError(f"invalid MNIST image file: {path}")
+    magic = int.from_bytes(data[0:4], "big")
+    count = int.from_bytes(data[4:8], "big")
+    rows = int.from_bytes(data[8:12], "big")
+    cols = int.from_bytes(data[12:16], "big")
+    if magic != 2051 or rows != IMG_H or cols != IMG_W:
+        raise ValueError(f"unexpected MNIST image header in {path}")
+    images = np.frombuffer(data, dtype=np.uint8, offset=16)
+    if images.size != count * rows * cols:
+        raise ValueError(f"corrupted MNIST image payload in {path}")
+    return images.reshape(count, rows, cols).copy()
+
+
+def load_mnist_labels(path: Path):
+    import numpy as np
+
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ValueError(f"invalid MNIST label file: {path}")
+    magic = int.from_bytes(data[0:4], "big")
+    count = int.from_bytes(data[4:8], "big")
+    if magic != 2049:
+        raise ValueError(f"unexpected MNIST label header in {path}")
+    labels = np.frombuffer(data, dtype=np.uint8, offset=8)
+    if labels.size != count:
+        raise ValueError(f"corrupted MNIST label payload in {path}")
+    return labels.copy()
+
+
+def load_mnist_split(raw_dir: Path, split: str):
+    key = (str(raw_dir.resolve()), split)
+    if key in _MNIST_CACHE:
+        return _MNIST_CACHE[key]
+
+    image_name, label_name = MNIST_SPLIT_FILES[split]
+    images = load_mnist_images(raw_dir / image_name)
+    labels = load_mnist_labels(raw_dir / label_name)
+    if images.shape[0] != labels.shape[0]:
+        raise ValueError(f"image/label count mismatch in split {split}")
+    _MNIST_CACHE[key] = (images, labels)
+    return images, labels
+
+
+def zero_image() -> np.ndarray:
+    import numpy as np
+
+    return np.zeros((IMG_BYTES,), dtype=np.uint8)
+
+
+def dataset_sample_name(split: str, label: int, index: int) -> Path:
+    return Path(f"{label}_{split}_idx{index}.mnist")
+
+
+def select_dataset_sample(
+    raw_dir: Path,
+    split: str,
+    label: int,
+    index: int,
+    invert: bool,
+    raw_resize: bool,
+    threshold: int | None,
+    auto_invert: bool,
+) -> tuple[Path, np.ndarray]:
+    images, labels = load_mnist_split(raw_dir, split)
+    matches = [int(i) for i, value in enumerate(labels) if int(value) == label]
+    if not matches:
+        raise FileNotFoundError(f"no MNIST samples for label {label} in {split}")
+    if index < 0 or index >= len(matches):
+        raise IndexError(
+            f"sample index {index} out of range for label {label} in {split} ({len(matches)} samples)"
+        )
+    dataset_index = matches[index]
+    sample = preprocess_pixels(
+        pixels=images[dataset_index],
+        invert=invert,
+        raw_resize=raw_resize,
+        threshold=threshold,
+        auto_invert=auto_invert,
+    )
+    return dataset_sample_name(split, label, dataset_index), sample
+
+
+def build_dataset_query_batch(
+    raw_dir: Path,
+    split: str,
+    test_count: int,
+    test_offset: int,
+    invert: bool,
+    raw_resize: bool,
+    threshold: int | None,
+    auto_invert: bool,
+) -> list[tuple[Path, int, np.ndarray]]:
+    images, labels = load_mnist_split(raw_dir, split)
+    if test_count < 1:
+        raise ValueError("--test-count must be positive")
+    if test_offset < 0 or test_offset + test_count > len(labels):
+        raise IndexError(
+            f"test selection out of range for split {split}: "
+            f"offset={test_offset}, count={test_count}, available={len(labels)}"
+        )
+
+    batch: list[tuple[Path, int, np.ndarray]] = []
+    for dataset_index in range(test_offset, test_offset + test_count):
+        label = int(labels[dataset_index])
+        sample = preprocess_pixels(
+            pixels=images[dataset_index],
+            invert=invert,
+            raw_resize=raw_resize,
+            threshold=threshold,
+            auto_invert=auto_invert,
+        )
+        batch.append((dataset_sample_name(split, label, dataset_index), label, sample))
+    return batch
+
+
+def build_dataset_support_set(
+    raw_dir: Path,
+    split: str,
+    label: int,
+    train_count: int,
+    train_offset: int,
+    invert: bool,
+    raw_resize: bool,
+    threshold: int | None,
+    auto_invert: bool,
+) -> tuple[list[tuple[int, np.ndarray]], list[tuple[int, Path]]]:
+    if train_count < 1 or train_count > NUM_TRAIN_IMG:
+        raise ValueError(f"--train-count must be in [1, {NUM_TRAIN_IMG}]")
+
+    images, labels = load_mnist_split(raw_dir, split)
+    matches = [int(i) for i, value in enumerate(labels) if int(value) == label]
+    if train_offset < 0 or train_offset + train_count > len(matches):
+        raise IndexError(
+            f"train selection out of range for label {label} in {split}: "
+            f"offset={train_offset}, count={train_count}, available={len(matches)}"
+        )
+
+    support_images: list[tuple[int, np.ndarray]] = []
+    support_paths: list[tuple[int, Path]] = []
+    for dataset_index in matches[train_offset : train_offset + train_count]:
+        sample = preprocess_pixels(
+            pixels=images[dataset_index],
+            invert=invert,
+            raw_resize=raw_resize,
+            threshold=threshold,
+            auto_invert=auto_invert,
+        )
+        support_images.append((label, sample))
+        support_paths.append((label, dataset_sample_name(split, label, dataset_index)))
+
+    while len(support_images) < NUM_TRAIN_IMG:
+        support_images.append((0, zero_image()))
+
+    return support_images, support_paths
+
+
 def load_image(
     path: Path,
+    invert: bool,
+    raw_resize: bool,
+    threshold: int | None,
+    auto_invert: bool,
+) -> np.ndarray:
+    from PIL import Image
+
+    pixels = Image.open(path).convert("L")
+    return preprocess_pixels(
+        pixels=pixels,
+        invert=invert,
+        raw_resize=raw_resize,
+        threshold=threshold,
+        auto_invert=auto_invert,
+    )
+
+
+def preprocess_pixels(
+    pixels,
     invert: bool,
     raw_resize: bool,
     threshold: int | None,
@@ -202,19 +479,18 @@ def load_image(
     import numpy as np
     from PIL import Image
 
-    image = Image.open(path).convert("L")
+    array = np.array(pixels, dtype=np.uint8)
     if raw_resize:
-        pixels = np.array(image.resize((IMG_W, IMG_H)), dtype=np.uint8)
+        resized = np.array(Image.fromarray(array).resize((IMG_W, IMG_H)), dtype=np.uint8)
         if invert:
-            pixels = np.uint8(255) - pixels
-        return pixels.reshape(IMG_BYTES)
+            resized = np.uint8(255) - resized
+        return resized.reshape(IMG_BYTES)
 
-    pixels = np.array(image, dtype=np.uint8)
     if auto_invert:
-        pixels = normalize_foreground_bright(pixels)
+        array = normalize_foreground_bright(array)
     if invert:
-        pixels = np.uint8(255) - pixels
-    return crop_center_resize(pixels, threshold).reshape(IMG_BYTES)
+        array = np.uint8(255) - array
+    return crop_center_resize(array, threshold).reshape(IMG_BYTES)
 
 
 def normalize_foreground_bright(pixels: np.ndarray) -> np.ndarray:
@@ -749,6 +1025,9 @@ def main(argv: list[str] | None = None) -> int:
         import sys
 
         argv = strip_ipykernel_args(sys.argv[1:])
+        if not argv and NOTEBOOK_AUTO_CONFIG:
+            argv = notebook_default_argv()
+            print("Notebook  : using NOTEBOOK_* defaults embedded in this script")
 
     parser = argparse.ArgumentParser(description="Run one image through the STDP SNN overlay")
     parser.add_argument(
@@ -759,6 +1038,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to one image file, or a directory where the first image will be used",
     )
     parser.add_argument("--bit", type=Path, default=None, help="Path to snn_stdp.bit")
+    parser.add_argument(
+        "--dataset",
+        action="store_true",
+        help="Use MNIST raw files instead of local jpg/png images",
+    )
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=None,
+        help="Directory containing MNIST raw files",
+    )
     parser.add_argument(
         "--batch",
         action="store_true",
@@ -784,6 +1074,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dma-ip", default="axi_dma_0")
     parser.add_argument("--timeout-s", type=float, default=5.0)
+    parser.add_argument("--train-split", choices=("train", "test"), default="train")
+    parser.add_argument("--test-split", choices=("train", "test"), default="test")
+    parser.add_argument("--train-label", type=int, default=None, help="Support label for dataset mode")
+    parser.add_argument("--test-label", type=int, default=0, help="Query label for dataset mode")
+    parser.add_argument("--train-count", type=int, default=NUM_TRAIN_IMG, help=f"Number of support samples to use in dataset mode (1-{NUM_TRAIN_IMG})")
+    parser.add_argument("--train-offset", type=int, default=0, help="Start offset inside the selected support label set")
+    parser.add_argument("--test-index", type=int, default=0, help="Index inside the selected query label set")
+    parser.add_argument("--test-count", type=int, default=1, help="Number of query samples to test in dataset batch mode")
+    parser.add_argument("--test-offset", type=int, default=0, help="Start offset for sequential dataset batch testing")
     parser.add_argument("--invert", action="store_true", help="Invert grayscale pixels before inference")
     parser.add_argument(
         "--no-auto-invert",
@@ -824,6 +1123,190 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--gain must be positive")
 
     bit_path = resolve_existing_path(args.bit, default_bit_candidates(), "bitstream")
+    dataset_mode = args.dataset or args.raw_dir is not None
+    raw_dir = resolve_raw_dir(args.raw_dir) if dataset_mode else None
+
+    if dataset_mode:
+        if args.train_count < 1 or args.train_count > NUM_TRAIN_IMG:
+            raise ValueError(f"--train-count must be in [1, {NUM_TRAIN_IMG}]")
+        if not (0 <= args.test_label < OUTPUT_CLASSES):
+            raise ValueError("--test-label must be in range [0, 9]")
+        if args.train_label is not None and not (0 <= args.train_label < OUTPUT_CLASSES):
+            raise ValueError("--train-label must be in range [0, 9]")
+
+        print(f"Dataset   : {raw_dir}")
+        print(
+            "TrainCfg  : "
+            f"split={args.train_split}, "
+            f"label={args.train_label if args.train_label is not None else 'same-as-query'}, "
+            f"count={args.train_count}/{NUM_TRAIN_IMG}, offset={args.train_offset}"
+        )
+        print(
+            "QueryCfg  : "
+            f"split={args.test_split}, label={args.test_label}, index={args.test_index}, "
+            f"count={args.test_count}, offset={args.test_offset}"
+        )
+        print("Weights   : transient per MODE_TRAIN call; not persisted across separate hardware calls")
+
+        dma, allocate_fn = prepare_runtime(bit_path, args.dma_ip)
+
+        if args.batch or args.test_count > 1:
+            import numpy as np
+
+            query_batch = build_dataset_query_batch(
+                raw_dir=raw_dir,
+                split=args.test_split,
+                test_count=args.test_count,
+                test_offset=args.test_offset,
+                invert=args.invert,
+                raw_resize=args.raw_resize,
+                threshold=args.threshold,
+                auto_invert=not args.no_auto_invert,
+            )
+            total_latency_ms = 0.0
+            total_infer_only_ms = 0.0
+            correct = 0
+            support_cache: dict[int, tuple[list[tuple[int, np.ndarray]], list[tuple[int, Path]]]] = {}
+            for query_name, query_label, query_image in query_batch:
+                support_label = query_label if args.train_label is None else args.train_label
+                if args.mode == "train":
+                    if support_label not in support_cache:
+                        support_cache[support_label] = build_dataset_support_set(
+                            raw_dir=raw_dir,
+                            split=args.train_split,
+                            label=support_label,
+                            train_count=args.train_count,
+                            train_offset=args.train_offset,
+                            invert=args.invert,
+                            raw_resize=args.raw_resize,
+                            threshold=args.threshold,
+                            auto_invert=not args.no_auto_invert,
+                        )
+                    support_images, _support_paths = support_cache[support_label]
+                else:
+                    support_images, _support_paths = ([], [])
+
+                infer_scores = None
+                infer_latency_ms = None
+                if args.mode == "train":
+                    infer_scores, infer_latency_ms, _, _, _ = run_prepared_image(
+                        dma=dma,
+                        allocate_fn=allocate_fn,
+                        image=query_image,
+                        support_images=[],
+                        mode="infer",
+                        timeout_s=args.timeout_s,
+                        gain=1.0 if args.gain is None else args.gain,
+                        auto_gain=False,
+                    )
+                    total_infer_only_ms += infer_latency_ms
+
+                scores, latency_ms, _, _, _ = run_prepared_image(
+                    dma=dma,
+                    allocate_fn=allocate_fn,
+                    image=query_image,
+                    support_images=support_images,
+                    mode=args.mode,
+                    timeout_s=args.timeout_s,
+                    gain=args.gain,
+                    auto_gain=not args.no_auto_gain,
+                )
+
+                if int(np.argmax(scores)) == query_label:
+                    correct += 1
+                total_latency_ms += latency_ms
+                print_batch_result(
+                    query_name,
+                    scores,
+                    latency_ms,
+                    query_label,
+                    args.mode,
+                    infer_scores,
+                    infer_latency_ms,
+                )
+
+            avg_latency_ms = total_latency_ms / len(query_batch)
+            avg_time_key = "avg_train+infer_time" if args.mode == "train" else "avg_inference_time"
+            total_time_key = "total_train+infer_time" if args.mode == "train" else "total_inference_time"
+            summary = (
+                f"Batch Summary: correct={correct}/{len(query_batch)}, "
+                f"{avg_time_key}={avg_latency_ms:.3f} ms, {total_time_key}={total_latency_ms:.3f} ms"
+            )
+            if args.mode == "train":
+                avg_infer_only_ms = total_infer_only_ms / len(query_batch)
+                summary += (
+                    f", avg_infer_only_time={avg_infer_only_ms:.3f} ms, "
+                    f"total_infer_only_time={total_infer_only_ms:.3f} ms"
+                )
+            print(summary)
+            return 0
+
+        query_name, query_image = select_dataset_sample(
+            raw_dir=raw_dir,
+            split=args.test_split,
+            label=args.test_label,
+            index=args.test_index,
+            invert=args.invert,
+            raw_resize=args.raw_resize,
+            threshold=args.threshold,
+            auto_invert=not args.no_auto_invert,
+        )
+        support_label = args.test_label if args.train_label is None else args.train_label
+        support_images, support_paths = (
+            build_dataset_support_set(
+                raw_dir=raw_dir,
+                split=args.train_split,
+                label=support_label,
+                train_count=args.train_count,
+                train_offset=args.train_offset,
+                invert=args.invert,
+                raw_resize=args.raw_resize,
+                threshold=args.threshold,
+                auto_invert=not args.no_auto_invert,
+            )
+            if args.mode == "train"
+            else ([], [])
+        )
+        infer_scores = None
+        infer_latency_ms = None
+        if args.mode == "train":
+            infer_scores, infer_latency_ms, _, _, _ = run_prepared_image(
+                dma=dma,
+                allocate_fn=allocate_fn,
+                image=query_image,
+                support_images=[],
+                mode="infer",
+                timeout_s=args.timeout_s,
+                gain=1.0 if args.gain is None else args.gain,
+                auto_gain=False,
+            )
+
+        scores, latency_ms, used_gain, stats, processed_image = run_prepared_image(
+            dma=dma,
+            allocate_fn=allocate_fn,
+            image=query_image,
+            support_images=support_images,
+            mode=args.mode,
+            timeout_s=args.timeout_s,
+            gain=args.gain,
+            auto_gain=not args.no_auto_gain,
+        )
+        print_result(
+            bit_path,
+            query_name,
+            args.mode,
+            scores,
+            latency_ms,
+            used_gain,
+            stats,
+            processed_image,
+            support_paths,
+            infer_scores,
+            infer_latency_ms,
+            args.show_pixels,
+        )
+        return 0
+
     batch_dir = args.batch_dir
     if batch_dir is None and args.image is not None and args.image.is_dir():
         batch_dir = args.image
