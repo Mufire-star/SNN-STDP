@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cstdint>
 #include <fstream>
 #include <array>
 #include <iostream>
@@ -57,7 +58,9 @@ static bool open_first_existing(std::ifstream &ifs, std::string &resolved_path, 
 static int collect_scores(
     hls::stream<axis_out_t> &out_stream,
     std::array<int, FC_OUT> &scores,
-    const char *tag)
+    const char *tag,
+    bool final_score_has_tlast = true,
+    bool require_empty = true)
 {
     int best_idx = -1;
     int best_val = -1;
@@ -75,7 +78,8 @@ static int collect_scores(
         scores[i] = int(o.data);
         all_zero = all_zero && (scores[i] == 0);
 
-        if ((i == FC_OUT - 1) != bool(o.last))
+        const bool expected_last = final_score_has_tlast && (i == FC_OUT - 1);
+        if (expected_last != bool(o.last))
         {
             std::cerr << tag << ": TLAST mismatch at class " << i << "\n";
             return -1;
@@ -88,7 +92,7 @@ static int collect_scores(
         }
     }
 
-    if (!out_stream.empty())
+    if (require_empty && !out_stream.empty())
     {
         std::cerr << tag << ": output stream has unexpected extra words\n";
         return -1;
@@ -100,6 +104,95 @@ static int collect_scores(
     }
 
     return best_idx;
+}
+
+static void push_byte(hls::stream<axis_in_t> &in_stream, unsigned char value, bool last = false)
+{
+    axis_in_t p;
+    p.data = value;
+    p.keep = -1;
+    p.strb = -1;
+    p.last = last ? 1 : 0;
+    in_stream.write(p);
+}
+
+static void push_s8(hls::stream<axis_in_t> &in_stream, int8_t value)
+{
+    push_byte(in_stream, static_cast<unsigned char>(value));
+}
+
+static int8_t encode_weight(float value)
+{
+    float scaled = value * 64.0f;
+    int raw = scaled >= 0.0f ? int(scaled + 0.5f) : int(scaled - 0.5f);
+    if (raw > 127)
+        raw = 127;
+    if (raw < -128)
+        raw = -128;
+    return static_cast<int8_t>(raw);
+}
+
+static std::vector<int8_t> initial_weight_words()
+{
+    std::vector<int8_t> weights(TOTAL_WEIGHT_WORDS);
+    int cursor = 0;
+
+    for (int idx = 0; idx < CONV1_W_SIZE; idx++)
+    {
+        const int bucket = (idx * 11 + 7) % 11;
+        const float values[] = {0.035f, 0.039f, 0.043f, 0.047f, 0.051f, 0.055f, 0.059f, 0.063f, 0.067f, 0.071f, 0.075f};
+        weights[cursor++] = encode_weight(values[bucket]);
+    }
+    for (int idx = 0; idx < CONV2_W_SIZE; idx++)
+    {
+        const int bucket = (idx * 13 + 5) % 6;
+        const float values[] = {0.020f, 0.027f, 0.034f, 0.041f, 0.048f, 0.055f};
+        weights[cursor++] = encode_weight(values[bucket]);
+    }
+    for (int idx = 0; idx < FC_W_SIZE; idx++)
+    {
+        weights[cursor++] = encode_weight(0.0f);
+    }
+
+    return weights;
+}
+
+static void push_weights(hls::stream<axis_in_t> &in_stream, const std::vector<int8_t> &weights)
+{
+    for (int i = 0; i < TOTAL_WEIGHT_WORDS; i++)
+    {
+        push_s8(in_stream, weights[i]);
+    }
+}
+
+static int collect_weights(
+    hls::stream<axis_out_t> &out_stream,
+    std::vector<int8_t> &weights,
+    const char *tag)
+{
+    weights.assign(TOTAL_WEIGHT_WORDS, 0);
+    for (int i = 0; i < TOTAL_WEIGHT_WORDS; i++)
+    {
+        if (out_stream.empty())
+        {
+            std::cerr << tag << ": output stream ended early at weight " << i << "\n";
+            return -1;
+        }
+        axis_out_t o = out_stream.read();
+        weights[i] = static_cast<int8_t>(static_cast<unsigned char>(o.data & 0x00FF));
+        const bool expected_last = (i == TOTAL_WEIGHT_WORDS - 1);
+        if (expected_last != bool(o.last))
+        {
+            std::cerr << tag << ": TLAST mismatch at weight " << i << "\n";
+            return -1;
+        }
+    }
+    if (!out_stream.empty())
+    {
+        std::cerr << tag << ": output stream has unexpected extra words\n";
+        return -1;
+    }
+    return 0;
 }
 
 static int run_infer(
@@ -177,6 +270,54 @@ static int run_train_then_infer(
 
     snn_top(in_stream, out_stream);
     return collect_scores(out_stream, scores, "train_then_infer");
+}
+
+static int run_weighted_train_only(
+    hls::stream<axis_in_t> &in_stream,
+    hls::stream<axis_out_t> &out_stream,
+    const std::vector<int8_t> &weights_in,
+    const std::vector<std::vector<unsigned char>> &train_images,
+    const std::vector<unsigned char> &train_labels,
+    std::vector<int8_t> &weights_out)
+{
+    push_byte(in_stream, MODE_WEIGHTED_TRAIN_ONLY);
+    push_weights(in_stream, weights_in);
+
+    for (int n = 0; n < NUM_TRAIN_IMG; n++)
+    {
+        push_byte(in_stream, train_labels[n]);
+        for (int i = 0; i < IMG_H * IMG_W; i++)
+        {
+            push_byte(in_stream, train_images[n][i]);
+        }
+    }
+
+    snn_top(in_stream, out_stream);
+    return collect_weights(out_stream, weights_out, "weighted_train_only");
+}
+
+static int run_weighted_infer(
+    hls::stream<axis_in_t> &in_stream,
+    hls::stream<axis_out_t> &out_stream,
+    const std::vector<int8_t> &weights,
+    const std::vector<unsigned char> &image,
+    std::array<int, FC_OUT> &scores,
+    std::vector<int8_t> &returned_weights)
+{
+    push_byte(in_stream, MODE_WEIGHTED_INFER);
+    push_weights(in_stream, weights);
+    for (int i = 0; i < IMG_H * IMG_W; i++)
+    {
+        push_byte(in_stream, image[i], i == IMG_H * IMG_W - 1);
+    }
+
+    snn_top(in_stream, out_stream);
+    const int pred = collect_scores(out_stream, scores, "weighted_infer", false, false);
+    if (pred < 0)
+        return -1;
+    if (collect_weights(out_stream, returned_weights, "weighted_infer") != 0)
+        return -1;
+    return pred;
 }
 
 int main()
@@ -272,6 +413,81 @@ int main()
     else
     {
         std::cout << "NOTE: This is an unsupervised STDP demo, so exact classification is not guaranteed.\n";
+    }
+
+    std::vector<int8_t> weights_before = initial_weight_words();
+    std::array<int, FC_OUT> echo_scores = {};
+    std::vector<int8_t> echo_weights;
+    const int pred_echo = run_weighted_infer(in_stream, out_stream, weights_before, images[0], echo_scores, echo_weights);
+    if (pred_echo < 0)
+    {
+        std::cerr << "Weighted infer echo path failed.\n";
+        return 3;
+    }
+
+    int echo_mismatches = 0;
+    int first_echo_mismatch = -1;
+    for (int i = 0; i < TOTAL_WEIGHT_WORDS; i++)
+    {
+        if (weights_before[i] != echo_weights[i])
+        {
+            if (first_echo_mismatch < 0)
+                first_echo_mismatch = i;
+            echo_mismatches++;
+        }
+    }
+    if (echo_mismatches != 0)
+    {
+        std::cerr << "Weighted infer did not preserve PS-supplied weights; mismatches="
+                  << echo_mismatches << ", first=" << first_echo_mismatch
+                  << ", sent=" << int(weights_before[first_echo_mismatch])
+                  << ", returned=" << int(echo_weights[first_echo_mismatch]) << "\n";
+        return 4;
+    }
+
+    std::vector<int8_t> weights_after;
+    if (run_weighted_train_only(in_stream, out_stream, weights_before, train_imgs, train_lbls, weights_after) != 0)
+    {
+        std::cerr << "Weighted train-only path failed.\n";
+        return 5;
+    }
+
+    int changed_total = 0;
+    int changed_fc = 0;
+    const int fc_start = CONV1_W_SIZE + CONV2_W_SIZE;
+    for (int i = 0; i < TOTAL_WEIGHT_WORDS; i++)
+    {
+        if (weights_before[i] != weights_after[i])
+        {
+            changed_total++;
+            if (i >= fc_start)
+                changed_fc++;
+        }
+    }
+
+    std::array<int, FC_OUT> weighted_scores = {};
+    std::vector<int8_t> returned_weights;
+    const int pred_weighted = run_weighted_infer(in_stream, out_stream, weights_after, images[0], weighted_scores, returned_weights);
+    if (pred_weighted < 0)
+    {
+        std::cerr << "Weighted infer path failed.\n";
+        return 6;
+    }
+
+    std::cout << "\n=== Weighted Persistence Protocol Summary ===\n";
+    std::cout << "Changed weights total:  " << changed_total << "\n";
+    std::cout << "Changed FC weights:     " << changed_fc << "\n";
+    std::cout << "Weighted infer result:  " << pred_weighted << "\n";
+    std::cout << "Weighted infer scores:  ";
+    for (int i = 0; i < FC_OUT; i++)
+    {
+        std::cout << weighted_scores[i] << (i + 1 == FC_OUT ? '\n' : ' ');
+    }
+
+    if (changed_fc == 0)
+    {
+        std::cerr << "Weighted train-only did not change any FC weights.\n";
+        return 7;
     }
 
     return 0;

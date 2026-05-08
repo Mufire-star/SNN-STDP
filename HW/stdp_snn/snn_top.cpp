@@ -112,11 +112,11 @@ static inline w_t fc_label_ltp(int dt)
 #pragma HLS INLINE
     switch (dt)
     {
-    case 0: return w_t(0.070);
-    case 1: return w_t(0.055);
-    case 2: return w_t(0.040);
-    case 3: return w_t(0.030);
-    default: return w_t(0.020);
+    case 0: return w_t(0.0234375);
+    case 1: return w_t(0.015625);
+    case 2: return w_t(0.01171875);
+    case 3: return w_t(0.0078125);
+    default: return w_t(0.00390625);
     }
 }
 
@@ -152,6 +152,91 @@ static inline dw_t stdp_ltd(int dt)
     }
 }
 
+static inline ap_uint<8> direct_feature_threshold(int channel)
+{
+#pragma HLS INLINE
+    return (channel == 0) ? ap_uint<8>(16) : ap_uint<8>(64);
+}
+
+static void build_direct_fc_seen(
+    pix_t img[IMG_H][IMG_W],
+    ap_uint<1> fc_seen[FC_IN])
+{
+    constexpr int DIRECT_THRESHOLDS = 2;
+    constexpr int DIRECT_GRID_H = 14;
+    constexpr int DIRECT_GRID_W = 14;
+    constexpr int DIRECT_BLOCK = 2;
+
+direct_feature_thresholds:
+    for (int th = 0; th < DIRECT_THRESHOLDS; th++)
+    {
+    direct_feature_rows:
+        for (int y = 0; y < DIRECT_GRID_H; y++)
+        {
+        direct_feature_cols:
+            for (int x = 0; x < DIRECT_GRID_W; x++)
+            {
+#pragma HLS PIPELINE II = 1
+                ap_uint<10> sum = 0;
+            direct_feature_block_y:
+                for (int dy = 0; dy < DIRECT_BLOCK; dy++)
+                {
+                direct_feature_block_x:
+                    for (int dx = 0; dx < DIRECT_BLOCK; dx++)
+                    {
+                        sum += img[y * DIRECT_BLOCK + dy][x * DIRECT_BLOCK + dx];
+                    }
+                }
+                const int idx = ((th * DIRECT_GRID_H + y) * DIRECT_GRID_W + x);
+                fc_seen[idx] = (sum > ap_uint<10>(direct_feature_threshold(th)) * DIRECT_BLOCK * DIRECT_BLOCK)
+                    ? ap_uint<1>(1)
+                    : ap_uint<1>(0);
+            }
+        }
+    }
+}
+
+static inline ap_int<8> read_s8(hls::stream<axis_in_t> &in_stream)
+{
+#pragma HLS INLINE
+    axis_in_t p = in_stream.read();
+    ap_uint<8> raw = p.data;
+    return ap_int<8>(raw);
+}
+
+static inline w_t decode_weight_word(ap_int<8> raw)
+{
+#pragma HLS INLINE
+    ap_fixed<24, 16> scaled = ap_fixed<24, 16>(raw) * ap_fixed<24, 16>(0.015625);
+    return w_t(scaled);
+}
+
+static inline ap_uint<16> encode_weight_word(w_t w)
+{
+#pragma HLS INLINE
+    ap_fixed<24, 16> scaled = ap_fixed<24, 16>(w) * ap_fixed<24, 16>(64.0);
+    ap_int<16> raw;
+    if (scaled > ap_fixed<24, 16>(127.0))
+        raw = ap_int<16>(127);
+    else if (scaled < ap_fixed<24, 16>(-128.0))
+        raw = ap_int<16>(-128);
+    else
+        raw = ap_int<16>(scaled);
+    ap_int<8> q = ap_int<8>(raw);
+    return ap_uint<16>(ap_int<16>(q));
+}
+
+static inline void write_u16(hls::stream<axis_out_t> &out_stream, ap_uint<16> data, bool last)
+{
+#pragma HLS INLINE
+    axis_out_t outp;
+    outp.data = data;
+    outp.keep = -1;
+    outp.strb = -1;
+    outp.last = last ? 1 : 0;
+    out_stream.write(outp);
+}
+
 void snn_top(hls::stream<axis_in_t> &in_stream, hls::stream<axis_out_t> &out_stream)
 {
 #pragma HLS INTERFACE axis port = in_stream
@@ -166,27 +251,64 @@ void snn_top(hls::stream<axis_in_t> &in_stream, hls::stream<axis_out_t> &out_str
 #pragma HLS BIND_STORAGE variable = rw_conv2_w type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = rw_fc_w type = ram_1p impl = bram
 
-init_conv1:
-    for (int i = 0; i < CONV1_W_SIZE; i++)
-    {
-#pragma HLS PIPELINE II = 1
-        rw_conv1_w[i] = init_conv1_weight(i);
-    }
-init_conv2:
-    for (int i = 0; i < CONV2_W_SIZE; i++)
-    {
-#pragma HLS PIPELINE II = 1
-        rw_conv2_w[i] = init_conv2_weight(i);
-    }
-init_fc:
-    for (int i = 0; i < FC_W_SIZE; i++)
-    {
-#pragma HLS PIPELINE II = 1
-        rw_fc_w[i] = init_fc_weight(i);
-    }
-
     axis_in_t mode_p = in_stream.read();
-    ap_uint<1> mode = mode_p.data & ap_uint<1>(1);
+    ap_uint<8> mode = mode_p.data;
+    const bool weighted_mode =
+        (mode == MODE_WEIGHTED_INFER) ||
+        (mode == MODE_WEIGHTED_TRAIN) ||
+        (mode == MODE_WEIGHTED_TRAIN_ONLY);
+    const bool train_mode =
+        (mode == MODE_TRAIN) ||
+        (mode == MODE_WEIGHTED_TRAIN) ||
+        (mode == MODE_WEIGHTED_TRAIN_ONLY);
+    const bool infer_mode =
+        (mode == MODE_INFER) ||
+        (mode == MODE_TRAIN) ||
+        (mode == MODE_WEIGHTED_INFER) ||
+        (mode == MODE_WEIGHTED_TRAIN);
+
+    if (weighted_mode)
+    {
+    read_conv1:
+        for (int i = 0; i < CONV1_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            rw_conv1_w[i] = decode_weight_word(read_s8(in_stream));
+        }
+    read_conv2:
+        for (int i = 0; i < CONV2_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            rw_conv2_w[i] = decode_weight_word(read_s8(in_stream));
+        }
+    read_fc:
+        for (int i = 0; i < FC_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            rw_fc_w[i] = decode_weight_word(read_s8(in_stream));
+        }
+    }
+    else
+    {
+init_conv1:
+        for (int i = 0; i < CONV1_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            rw_conv1_w[i] = init_conv1_weight(i);
+        }
+init_conv2:
+        for (int i = 0; i < CONV2_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            rw_conv2_w[i] = init_conv2_weight(i);
+        }
+init_fc:
+        for (int i = 0; i < FC_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            rw_fc_w[i] = init_fc_weight(i);
+        }
+    }
 
     pix_t img[IMG_H][IMG_W];
     ap_uint<1> in_spk[IMG_H][IMG_W];
@@ -200,6 +322,7 @@ init_fc:
     mem_t fc_next[FC_OUT];
     ap_uint<1> spk3[FC_OUT];
     spike_cnt_t spike_cnt[FC_OUT];
+    ap_uint<1> fc_seen[FC_IN];
     ts_t last_pre_conv1[IMG_H][IMG_W];
     ts_t last_post_conv1[C1][IMG_H][IMG_W];
     ts_t last_pre_conv2[C1][P1_H][P1_W];
@@ -217,6 +340,7 @@ init_fc:
 #pragma HLS BIND_STORAGE variable = mem2 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = spk2 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = p2 type = ram_1p impl = bram
+#pragma HLS BIND_STORAGE variable = fc_seen type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_pre_conv1 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_post_conv1 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_pre_conv2 type = ram_1p impl = bram
@@ -228,7 +352,7 @@ init_fc:
     const mem_t fc_v_th = mem_t(0.12);
     const mem_t alpha = mem_t(0.6);
 
-    if (mode == MODE_TRAIN)
+    if (train_mode)
     {
     train_loop:
         for (int n = 0; n < NUM_TRAIN_IMG; n++)
@@ -293,6 +417,12 @@ init_fc:
                 for (int i = 0; i < P2_H; i++)
                     for (int j = 0; j < P2_W; j++)
                         last_pre_fc[oc][i][j] = TS_NONE;
+        reset_fc_seen_train:
+            for (int i = 0; i < FC_IN; i++)
+            {
+#pragma HLS PIPELINE II = 1
+                fc_seen[i] = ap_uint<1>(0);
+            }
         reset_ts_fc_post:
             for (int o = 0; o < FC_OUT; o++)
                 last_post_fc[o] = TS_NONE;
@@ -313,11 +443,17 @@ init_fc:
                 }
             }
 
-            ap_uint<16> lfsr = 0xACE1;
+            if (weighted_mode)
+            {
+                build_direct_fc_seen(img, fc_seen);
+            }
+            else
+            {
+                ap_uint<16> lfsr = 0xACE1;
 
         train_time_loop:
-            for (int t = 0; t < T_STEPS; t++)
-            {
+                for (int t = 0; t < T_STEPS; t++)
+                {
 
             compute_in_spk_train:
                 for (int i = 0; i < IMG_H; i++)
@@ -375,7 +511,7 @@ init_fc:
                     }
                 }
 
-            const bool enable_conv_stdp = true;
+            const bool enable_conv_stdp = false;
             if (enable_conv_stdp)
             {
             stdp_conv1_ltp:
@@ -551,8 +687,6 @@ init_fc:
                     }
                 }
 
-                ap_uint<1> any_fc_pre = ap_uint<1>(0);
-
             update_pre_fc:
                 for (int oc = 0; oc < C2; oc++)
                 {
@@ -564,117 +698,28 @@ init_fc:
                             if (p2[oc][i][j])
                             {
                                 last_pre_fc[oc][i][j] = ts_t(t);
-                                any_fc_pre = ap_uint<1>(1);
-                            }
-                        }
-                    }
-                }
-
-                int fc_winner = -1;
-                mem_t fc_best = mem_t(-128);
-
-            fc_lif_train_eval:
-                for (int o = 0; o < FC_OUT; o++)
-                {
-                    acc_t sum = fc_bias(o);
-                    for (int oc = 0; oc < C2; oc++)
-                    {
-                        for (int i = 0; i < P2_H; i++)
-                        {
-                            for (int j = 0; j < P2_W; j++)
-                            {
                                 const int idx = ((oc * P2_H + i) * P2_W + j);
-                                if (p2[oc][i][j])
-                                {
-                                    sum += rw_fc_w[idx_fc(o, idx)];
-                                }
+                                fc_seen[idx] = ap_uint<1>(1);
                             }
                         }
                     }
-                    mem_t m = mem3[o] + alpha * (mem_t(sum) - mem3[o]);
-                    fc_next[o] = m;
-                    if (m >= fc_v_th && (fc_winner < 0 || m > fc_best))
-                    {
-                        fc_best = m;
-                        fc_winner = o;
-                    }
                 }
+                }
+            }
 
-            fc_lif_train_commit:
-                for (int o = 0; o < FC_OUT; o++)
-                {
+        prototype_fc_update:
+            for (int idx = 0; idx < FC_IN; idx++)
+            {
 #pragma HLS PIPELINE II = 1
-                    ap_uint<1> s = (any_fc_pre && o == int(train_label)) ? ap_uint<1>(1) : ap_uint<1>(0);
-                    mem3[o] = s ? mem_t(fc_next[o] - fc_v_th) : mem_t(fc_next[o]);
-                    spk3[o] = s;
-                    spike_cnt[o] += s;
-                    if (s)
-                        last_post_fc[o] = ts_t(t);
-                }
-
-            stdp_fc_ltp:
-                for (int o = 0; o < FC_OUT; o++)
-                {
-                    if (!spk3[o])
-                        continue;
-                    for (int oc = 0; oc < C2; oc++)
-                    {
-                        for (int i = 0; i < P2_H; i++)
-                        {
-                            for (int j = 0; j < P2_W; j++)
-                            {
-                                const int idx = ((oc * P2_H + i) * P2_W + j);
-                                int widx = idx_fc(o, idx);
-                                if (p2[oc][i][j])
-                                {
-                                    rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + fc_label_ltp(0));
-                                }
-                                else if (last_pre_fc[oc][i][j] != TS_NONE)
-                                {
-                                    int dt = t - int(last_pre_fc[oc][i][j]);
-                                    if (dt > 0 && dt < T_STEPS)
-                                    {
-                                        rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + fc_label_ltp(dt));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            stdp_fc_ltd:
-                for (int oc = 0; oc < C2; oc++)
-                {
-                    for (int i = 0; i < P2_H; i++)
-                    {
-                        for (int j = 0; j < P2_W; j++)
-                        {
-                            if (!p2[oc][i][j])
-                                continue;
-                            for (int o = 0; o < FC_OUT; o++)
-                            {
-                                const int idx = ((oc * P2_H + i) * P2_W + j);
-                                int widx = idx_fc(o, idx);
-                                if (o != int(train_label))
-                                {
-                                    rw_fc_w[widx] = clamp_w(rw_fc_w[widx] - w_t(0.004));
-                                    continue;
-                                }
-                                if (last_post_fc[o] == TS_NONE)
-                                    continue;
-                                int dt = t - int(last_post_fc[o]);
-                                if (dt > 0 && dt < T_STEPS && !spk3[o])
-                                {
-                                    dw_t dw = stdp_ltd(dt);
-                                    rw_fc_w[widx] = clamp_w(rw_fc_w[widx] - w_t(dw));
-                                }
-                            }
-                        }
-                    }
-                }
+                const w_t delta = fc_seen[idx] ? w_t(0.03125) : w_t(-0.03125);
+                int widx = idx_fc(int(train_label), idx);
+                rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + delta);
             }
         }
     }
 
+    if (infer_mode)
+    {
 infer_reset_mem1:
     for (int oc = 0; oc < C1; oc++)
         for (int i = 0; i < IMG_H; i++)
@@ -710,6 +755,12 @@ infer_reset_fc:
         spk3[o] = ap_uint<1>(0);
         spike_cnt[o] = spike_cnt_t(0);
     }
+infer_reset_fc_seen:
+    for (int i = 0; i < FC_IN; i++)
+    {
+#pragma HLS PIPELINE II = 1
+        fc_seen[i] = ap_uint<1>(0);
+    }
 
     load_infer_img:
     for (int i = 0; i < IMG_H; i++)
@@ -722,6 +773,11 @@ infer_reset_fc:
         }
     }
 
+    if (weighted_mode)
+    {
+        build_direct_fc_seen(img, fc_seen);
+    }
+    else
     {
         ap_uint<16> lfsr = 0xACE1;
 
@@ -842,6 +898,11 @@ infer_reset_fc:
                             }
                         }
                         p2[oc][i][j] = v;
+                        if (v)
+                        {
+                            const int idx = ((oc * P2_H + i) * P2_W + j);
+                            fc_seen[idx] = ap_uint<1>(1);
+                        }
                     }
                 }
             }
@@ -869,7 +930,7 @@ infer_reset_fc:
                 }
                 mem_t m = mem3[o] + alpha * (mem_t(sum) - mem3[o]);
                 fc_next[o] = m;
-                if (m >= fc_v_th && (fc_winner < 0 || m > fc_best))
+                if (fc_winner < 0 || m > fc_best)
                 {
                     fc_best = m;
                     fc_winner = o;
@@ -887,17 +948,55 @@ infer_reset_fc:
             }
         }
     }
+output_scores:
+        for (int o = 0; o < FC_OUT; o++)
+        {
+            ap_uint<16> q = (ap_uint<16>(spike_cnt[o]) * 256) / T_STEPS;
+            if (weighted_mode)
+            {
+                ap_fixed<24, 12> score = ap_fixed<24, 12>(0);
+                for (int idx = 0; idx < FC_IN; idx++)
+                {
+                    if (fc_seen[idx])
+                        score += ap_fixed<24, 12>(rw_fc_w[idx_fc(o, idx)]);
+                    else
+                        score -= ap_fixed<24, 12>(rw_fc_w[idx_fc(o, idx)]);
+                }
+                ap_fixed<28, 16> scaled =
+                    (ap_fixed<28, 16>(score) + ap_fixed<28, 16>(512.0)) *
+                    ap_fixed<28, 16>(4.0);
+                if (scaled <= ap_fixed<28, 16>(0))
+                    q = ap_uint<16>(0);
+                else if (scaled >= ap_fixed<28, 16>(4095))
+                    q = ap_uint<16>(4095);
+                else
+                    q = ap_uint<16>(scaled);
+            }
+            const bool last_score = (!weighted_mode && o == FC_OUT - 1);
+            write_u16(out_stream, q, last_score);
+        }
+    }
 
-output:
-    for (int o = 0; o < FC_OUT; o++)
+    if (weighted_mode)
     {
+dump_conv1:
+        for (int i = 0; i < CONV1_W_SIZE; i++)
+        {
 #pragma HLS PIPELINE II = 1
-        axis_out_t outp;
-        ap_uint<16> q = (ap_uint<16>(spike_cnt[o]) * 256) / T_STEPS;
-        outp.data = q;
-        outp.keep = -1;
-        outp.strb = -1;
-        outp.last = (o == FC_OUT - 1) ? 1 : 0;
-        out_stream.write(outp);
+            write_u16(out_stream, encode_weight_word(rw_conv1_w[i]), false);
+        }
+dump_conv2:
+        for (int i = 0; i < CONV2_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            write_u16(out_stream, encode_weight_word(rw_conv2_w[i]), false);
+        }
+dump_fc:
+        for (int i = 0; i < FC_W_SIZE; i++)
+        {
+#pragma HLS PIPELINE II = 1
+            const bool last_weight = (i == FC_W_SIZE - 1);
+            write_u16(out_stream, encode_weight_word(rw_fc_w[i]), last_weight);
+        }
     }
 }

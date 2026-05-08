@@ -9,12 +9,27 @@ from pathlib import Path
 
 MODE_INFER = 0
 MODE_TRAIN = 1
+MODE_WEIGHTED_INFER = 2
+MODE_WEIGHTED_TRAIN = 3
+MODE_WEIGHTED_TRAIN_ONLY = 4
 IMG_H = 28
 IMG_W = 28
 IMG_BYTES = IMG_H * IMG_W
 OUTPUT_CLASSES = 10
 OUTPUT_BYTES = OUTPUT_CLASSES * 2
 NUM_TRAIN_IMG = 10
+C1 = 8
+C2 = 8
+K = 3
+P2_H = 7
+P2_W = 7
+FC_IN = C2 * P2_H * P2_W
+CONV1_W_SIZE = C1 * K * K
+CONV2_W_SIZE = C2 * C1 * K * K
+FC_W_SIZE = OUTPUT_CLASSES * FC_IN
+TOTAL_WEIGHT_WORDS = CONV1_W_SIZE + CONV2_W_SIZE + FC_W_SIZE
+WEIGHT_BYTES = TOTAL_WEIGHT_WORDS
+WEIGHT_SCALE = 64.0
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 DEFAULT_GAINS = (1.0, 0.75, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08)
 MNIST_SPLIT_FILES = {
@@ -33,11 +48,17 @@ NOTEBOOK_TRAIN_SPLIT = "train"
 NOTEBOOK_TEST_SPLIT = "test"
 NOTEBOOK_TRAIN_LABEL: int | None = None
 NOTEBOOK_TEST_LABEL = 2
-NOTEBOOK_TRAIN_COUNT = 4
+NOTEBOOK_TRAIN_COUNT = 10
 NOTEBOOK_TRAIN_OFFSET = 0
 NOTEBOOK_TEST_INDEX = 0
 NOTEBOOK_TEST_COUNT = 100
 NOTEBOOK_TEST_OFFSET = 0
+NOTEBOOK_USE_WEIGHTED_MODES = True
+NOTEBOOK_WEIGHT_FILE = "stdp_weights.npz"
+NOTEBOOK_WEIGHT_LOG_DIR = "weight_logs"
+NOTEBOOK_TRAIN_ROUNDS = 300
+NOTEBOOK_SAVE_EVERY_ROUND = True
+NOTEBOOK_RESET_WEIGHTS = False
 NOTEBOOK_GAIN: float | None = None
 NOTEBOOK_BIT: str | None = None
 NOTEBOOK_IMAGE: str | None = None
@@ -225,10 +246,19 @@ def notebook_default_argv() -> list[str]:
         argv.extend(["--test-index", str(NOTEBOOK_TEST_INDEX)])
         argv.extend(["--test-count", str(NOTEBOOK_TEST_COUNT)])
         argv.extend(["--test-offset", str(NOTEBOOK_TEST_OFFSET)])
+        argv.extend(["--weight-file", NOTEBOOK_WEIGHT_FILE])
+        argv.extend(["--weight-log-dir", NOTEBOOK_WEIGHT_LOG_DIR])
+        argv.extend(["--train-rounds", str(NOTEBOOK_TRAIN_ROUNDS)])
         if NOTEBOOK_TRAIN_LABEL is not None:
             argv.extend(["--train-label", str(NOTEBOOK_TRAIN_LABEL)])
         if NOTEBOOK_BATCH or NOTEBOOK_TEST_COUNT > 1:
             argv.append("--batch")
+        if not NOTEBOOK_USE_WEIGHTED_MODES:
+            argv.append("--legacy-protocol")
+        if not NOTEBOOK_SAVE_EVERY_ROUND:
+            argv.append("--no-save-every-round")
+        if NOTEBOOK_RESET_WEIGHTS:
+            argv.append("--reset-weights")
     else:
         if NOTEBOOK_IMAGE:
             argv.append(NOTEBOOK_IMAGE)
@@ -700,11 +730,313 @@ def build_train_payload(
     return payload
 
 
-def run_payload(dma, allocate_fn, payload: np.ndarray, timeout_s: float) -> np.ndarray:
+def init_conv1_weight_value(idx: int) -> float:
+    bucket = (idx * 11 + 7) % 11
+    values = (0.035, 0.039, 0.043, 0.047, 0.051, 0.055, 0.059, 0.063, 0.067, 0.071, 0.075)
+    return values[bucket]
+
+
+def init_conv2_weight_value(idx: int) -> float:
+    bucket = (idx * 13 + 5) % 6
+    values = (0.020, 0.027, 0.034, 0.041, 0.048, 0.055)
+    return values[bucket]
+
+
+def init_fc_weight_value(idx: int) -> float:
+    return 0.0
+
+
+def initial_weights() -> dict[str, np.ndarray]:
+    import numpy as np
+
+    weights = {
+        "conv1": np.array([init_conv1_weight_value(i) for i in range(CONV1_W_SIZE)], dtype=np.float32),
+        "conv2": np.array([init_conv2_weight_value(i) for i in range(CONV2_W_SIZE)], dtype=np.float32),
+        "fc": np.array([init_fc_weight_value(i) for i in range(FC_W_SIZE)], dtype=np.float32),
+    }
+    return {
+        key: (np.rint(value * WEIGHT_SCALE) / WEIGHT_SCALE).astype(np.float32)
+        for key, value in weights.items()
+    }
+
+
+def validate_weights(weights: dict[str, np.ndarray]) -> None:
+    expected = {
+        "conv1": CONV1_W_SIZE,
+        "conv2": CONV2_W_SIZE,
+        "fc": FC_W_SIZE,
+    }
+    for key, size in expected.items():
+        if key not in weights:
+            raise ValueError(f"missing weight array: {key}")
+        if weights[key].shape != (size,):
+            raise ValueError(f"{key} weights must have shape {(size,)}, got {weights[key].shape}")
+
+
+def flatten_weights(weights: dict[str, np.ndarray]) -> np.ndarray:
+    import numpy as np
+
+    validate_weights(weights)
+    return np.concatenate([weights["conv1"], weights["conv2"], weights["fc"]]).astype(np.float32, copy=False)
+
+
+def split_weights(flat: np.ndarray) -> dict[str, np.ndarray]:
+    import numpy as np
+
+    if flat.shape != (TOTAL_WEIGHT_WORDS,):
+        raise ValueError(f"expected {TOTAL_WEIGHT_WORDS} weight words, got {flat.shape}")
+    c1_end = CONV1_W_SIZE
+    c2_end = c1_end + CONV2_W_SIZE
+    return {
+        "conv1": np.array(flat[:c1_end], dtype=np.float32, copy=True),
+        "conv2": np.array(flat[c1_end:c2_end], dtype=np.float32, copy=True),
+        "fc": np.array(flat[c2_end:], dtype=np.float32, copy=True),
+    }
+
+
+def encode_weight_bytes(weights: dict[str, np.ndarray]) -> np.ndarray:
+    import numpy as np
+
+    flat = flatten_weights(weights)
+    raw = np.rint(flat.astype(np.float32) * WEIGHT_SCALE)
+    raw = np.clip(raw, -128, 127).astype(np.int8, copy=False)
+    return raw.view(np.uint8)
+
+
+def decode_weight_words(words: np.ndarray) -> dict[str, np.ndarray]:
+    import numpy as np
+
+    if words.shape != (TOTAL_WEIGHT_WORDS,):
+        raise ValueError(f"expected {TOTAL_WEIGHT_WORDS} returned weights, got {words.shape}")
+    low_bytes = np.ascontiguousarray((words.astype(np.uint16, copy=False) & 0x00FF).astype(np.uint8))
+    signed = low_bytes.view(np.int8)
+    flat = signed.astype(np.float32) / WEIGHT_SCALE
+    return split_weights(flat)
+
+
+def save_weights(path: Path, weights: dict[str, np.ndarray], **metadata) -> None:
+    import numpy as np
+    from datetime import datetime
+
+    validate_weights(weights)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "conv1": weights["conv1"],
+        "conv2": weights["conv2"],
+        "fc": weights["fc"],
+        "timestamp": np.array(metadata.pop("timestamp", datetime.now().isoformat(timespec="seconds"))),
+    }
+    for key, value in metadata.items():
+        payload[key] = np.array(value)
+    np.savez(path, **payload)
+
+
+def load_weights(path: Path) -> dict[str, np.ndarray]:
+    import numpy as np
+
+    if not path.exists():
+        raise FileNotFoundError(f"weight file not found: {path}; run --mode train first")
+    with np.load(path) as data:
+        weights = {
+            "conv1": np.array(data["conv1"], dtype=np.float32, copy=True).reshape(CONV1_W_SIZE),
+            "conv2": np.array(data["conv2"], dtype=np.float32, copy=True).reshape(CONV2_W_SIZE),
+            "fc": np.array(data["fc"], dtype=np.float32, copy=True).reshape(FC_W_SIZE),
+        }
+    validate_weights(weights)
+    return weights
+
+
+def weight_delta_summary(before: dict[str, np.ndarray], after: dict[str, np.ndarray]) -> dict[str, dict[str, float]]:
+    import numpy as np
+
+    validate_weights(before)
+    validate_weights(after)
+    summary: dict[str, dict[str, float]] = {}
+    for key in ("conv1", "conv2", "fc"):
+        delta = after[key] - before[key]
+        changed = np.abs(delta) > 0
+        summary[key] = {
+            "changed": int(np.count_nonzero(changed)),
+            "max_abs_delta": float(np.max(np.abs(delta))) if delta.size else 0.0,
+            "mean_abs_delta": float(np.mean(np.abs(delta))) if delta.size else 0.0,
+        }
+    return summary
+
+
+def first_changed_entries(
+    before: dict[str, np.ndarray],
+    after: dict[str, np.ndarray],
+    layer: str = "fc",
+    limit: int = 8,
+) -> list[tuple[int, float, float, float]]:
+    import numpy as np
+
+    delta = after[layer] - before[layer]
+    indices = np.flatnonzero(np.abs(delta) > 0)[:limit]
+    return [
+        (int(idx), float(before[layer][idx]), float(after[layer][idx]), float(delta[idx]))
+        for idx in indices
+    ]
+
+
+def print_weight_delta(round_idx: int, before: dict[str, np.ndarray], after: dict[str, np.ndarray]) -> None:
+    summary = weight_delta_summary(before, after)
+    changed_fc = first_changed_entries(before, after, "fc")
+    print(f"Round {round_idx:02d}:")
+    for layer in ("conv1", "conv2", "fc"):
+        item = summary[layer]
+        print(
+            f"  {layer:<5} changed={item['changed']}, "
+            f"max_abs_delta={item['max_abs_delta']:.6f}, "
+            f"mean_abs_delta={item['mean_abs_delta']:.6f}"
+        )
+    print(f"  first_changed_fc={changed_fc}")
+
+
+def build_weighted_infer_payload(weights: dict[str, np.ndarray], image: np.ndarray) -> np.ndarray:
+    import numpy as np
+
+    if image.shape != (IMG_BYTES,):
+        raise ValueError(f"image must contain {IMG_BYTES} pixels, got shape {image.shape}")
+    weight_bytes = encode_weight_bytes(weights)
+    payload = np.empty((1 + weight_bytes.size + IMG_BYTES,), dtype=np.uint8)
+    cursor = 0
+    payload[cursor] = MODE_WEIGHTED_INFER
+    cursor += 1
+    payload[cursor : cursor + weight_bytes.size] = weight_bytes
+    cursor += weight_bytes.size
+    payload[cursor : cursor + IMG_BYTES] = image
+    return payload
+
+
+def build_weighted_train_only_payload(
+    weights: dict[str, np.ndarray],
+    support_images: list[tuple[int, np.ndarray]],
+) -> np.ndarray:
+    import numpy as np
+
+    if len(support_images) != NUM_TRAIN_IMG:
+        raise ValueError(f"expected {NUM_TRAIN_IMG} support images, got {len(support_images)}")
+    weight_bytes = encode_weight_bytes(weights)
+    payload = np.empty((1 + weight_bytes.size + NUM_TRAIN_IMG * (1 + IMG_BYTES),), dtype=np.uint8)
+    cursor = 0
+    payload[cursor] = MODE_WEIGHTED_TRAIN_ONLY
+    cursor += 1
+    payload[cursor : cursor + weight_bytes.size] = weight_bytes
+    cursor += weight_bytes.size
+    for label, image in support_images:
+        if image.shape != (IMG_BYTES,):
+            raise ValueError(f"support image must contain {IMG_BYTES} pixels, got shape {image.shape}")
+        if not (0 <= label < OUTPUT_CLASSES):
+            raise ValueError(f"support label out of range: {label}")
+        payload[cursor] = label
+        cursor += 1
+        payload[cursor : cursor + IMG_BYTES] = image
+        cursor += IMG_BYTES
+    return payload
+
+
+def parse_weighted_infer_output(words: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    import numpy as np
+
+    expected = OUTPUT_CLASSES + TOTAL_WEIGHT_WORDS
+    if words.shape != (expected,):
+        raise RuntimeError(f"invalid weighted infer output shape {words.shape}, expected {(expected,)}")
+    scores = np.array(words[:OUTPUT_CLASSES], dtype=np.uint16, copy=True)
+    weights = decode_weight_words(words[OUTPUT_CLASSES:])
+    return scores, weights
+
+
+def parse_weighted_train_only_output(words: np.ndarray) -> dict[str, np.ndarray]:
+    if words.shape != (TOTAL_WEIGHT_WORDS,):
+        raise RuntimeError(
+            f"invalid weighted train-only output shape {words.shape}, expected {(TOTAL_WEIGHT_WORDS,)}"
+        )
+    return decode_weight_words(words)
+
+
+def run_weighted_train_only(
+    dma,
+    allocate_fn,
+    weights: dict[str, np.ndarray],
+    support_images: list[tuple[int, np.ndarray]],
+    timeout_s: float,
+) -> tuple[dict[str, np.ndarray], float]:
+    payload = build_weighted_train_only_payload(weights, support_images)
+    t0 = time.perf_counter()
+    words = run_payload(
+        dma,
+        allocate_fn,
+        payload,
+        timeout_s=timeout_s,
+        output_words=TOTAL_WEIGHT_WORDS,
+    )
+    latency_ms = (time.perf_counter() - t0) * 1e3
+    return parse_weighted_train_only_output(words), latency_ms
+
+
+def run_weighted_infer_prepared(
+    dma,
+    allocate_fn,
+    weights: dict[str, np.ndarray],
+    image: np.ndarray,
+    timeout_s: float,
+    gain: float | None,
+    auto_gain: bool,
+) -> tuple[np.ndarray, dict[str, np.ndarray], float, float]:
+    if gain is not None:
+        gains = [gain]
+    else:
+        # Persistent weighted inference must use the same pixel scale that was
+        # used while training the saved weights. The legacy auto-gain sweep can
+        # change binary direct features and make the classifier pick a different
+        # class for the wrong reason.
+        gains = [1.0]
+
+    attempts: list[tuple[float, np.ndarray, dict[str, np.ndarray], float]] = []
+    for current_gain in gains:
+        test_image = scale_image(image, current_gain)
+        payload = build_weighted_infer_payload(weights, test_image)
+        t0 = time.perf_counter()
+        words = run_payload(
+            dma,
+            allocate_fn,
+            payload,
+            timeout_s=timeout_s,
+            output_words=OUTPUT_CLASSES + TOTAL_WEIGHT_WORDS,
+        )
+        latency_ms = (time.perf_counter() - t0) * 1e3
+        scores, returned_weights = parse_weighted_infer_output(words)
+        attempts.append((current_gain, scores, returned_weights, latency_ms))
+
+        if gain is not None or not auto_gain:
+            break
+
+    nonflat = [attempt for attempt in attempts if score_spread(attempt[1]) > 0]
+    if nonflat:
+        best_gain, best_scores, best_weights, best_latency_ms = max(
+            nonflat, key=lambda item: score_spread(item[1])
+        )
+    else:
+        nonsaturated = [attempt for attempt in attempts if not scores_are_saturated(attempt[1])]
+        best_gain, best_scores, best_weights, best_latency_ms = (
+            nonsaturated[0] if nonsaturated else attempts[-1]
+        )
+
+    return best_scores, best_weights, best_latency_ms, best_gain
+
+
+def run_payload(
+    dma,
+    allocate_fn,
+    payload: np.ndarray,
+    timeout_s: float,
+    output_words: int = OUTPUT_CLASSES,
+) -> np.ndarray:
     import numpy as np
 
     in_buf = allocate_fn(shape=(payload.size,), dtype=np.uint8)
-    out_buf = allocate_fn(shape=(OUTPUT_CLASSES,), dtype=np.uint16)
+    out_buf = allocate_fn(shape=(output_words,), dtype=np.uint16)
     try:
         in_buf[:] = payload
         out_buf[:] = 0
@@ -717,7 +1049,7 @@ def run_payload(dma, allocate_fn, payload: np.ndarray, timeout_s: float) -> np.n
         dma.write(S2MM_DMASR, dma.read(S2MM_DMASR) & DMA_SR_IRQ_MASK)
 
         dma.write(S2MM_DA, out_buf.device_address)
-        dma.write(S2MM_LENGTH, OUTPUT_BYTES)
+        dma.write(S2MM_LENGTH, output_words * 2)
         dma.write(MM2S_SA, in_buf.device_address)
         dma.write(MM2S_LENGTH, int(payload.size))
 
@@ -730,7 +1062,8 @@ def run_payload(dma, allocate_fn, payload: np.ndarray, timeout_s: float) -> np.n
         in_buf.freebuffer()
         out_buf.freebuffer()
 
-    validate_scores(scores)
+    if output_words == OUTPUT_CLASSES:
+        validate_scores(scores)
     return scores
 
 
@@ -1002,6 +1335,292 @@ def print_batch_result(
     )
 
 
+def round_training_sample_index(args, round_idx: int) -> int:
+    return args.train_offset + round_idx - 1
+
+
+def build_balanced_support_set(
+    raw_dir: Path,
+    split: str,
+    sample_index: int,
+    label_count: int,
+    invert: bool,
+    raw_resize: bool,
+    threshold: int | None,
+    auto_invert: bool,
+) -> tuple[list[tuple[int, np.ndarray]], list[tuple[int, Path]]]:
+    images, labels = load_mnist_split(raw_dir, split)
+    if label_count < 1 or label_count > OUTPUT_CLASSES:
+        raise ValueError(f"label_count must be in [1, {OUTPUT_CLASSES}]")
+
+    support_images: list[tuple[int, np.ndarray]] = []
+    support_paths: list[tuple[int, Path]] = []
+    for label in range(label_count):
+        matches = [int(i) for i, value in enumerate(labels) if int(value) == label]
+        if not matches:
+            raise FileNotFoundError(f"no MNIST samples for label {label} in {split}")
+        dataset_index = matches[sample_index % len(matches)]
+        sample = preprocess_pixels(
+            pixels=images[dataset_index],
+            invert=invert,
+            raw_resize=raw_resize,
+            threshold=threshold,
+            auto_invert=auto_invert,
+        )
+        support_images.append((label, sample))
+        support_paths.append((label, dataset_sample_name(split, label, dataset_index)))
+
+    while len(support_images) < NUM_TRAIN_IMG:
+        support_images.append((0, zero_image()))
+
+    return support_images, support_paths
+
+
+def weighted_train_config_text(args) -> str:
+    if args.train_label is None:
+        return (
+            f"split={args.train_split}, support=balanced-labels-0..9, "
+            f"samples_per_round={OUTPUT_CLASSES}/{NUM_TRAIN_IMG}, "
+            f"start_index={args.train_offset}"
+        )
+    return (
+        f"split={args.train_split}, support=single-label-{args.train_label}, "
+        f"count={args.train_count}/{NUM_TRAIN_IMG}, offset={args.train_offset}"
+    )
+
+
+def load_or_initialize_training_weights(args) -> tuple[dict[str, np.ndarray], str]:
+    if args.weight_file.exists() and not args.reset_weights:
+        return load_weights(args.weight_file), f"loaded from {args.weight_file}"
+    return initial_weights(), "generated in PS"
+
+
+def maybe_save_round_weights(
+    args,
+    round_idx: int,
+    weights: dict[str, np.ndarray],
+    *,
+    train_label: int | None = None,
+    train_offset: int | None = None,
+) -> None:
+    if not args.save_every_round:
+        return
+
+    if round_idx == 0:
+        name = "round_000_initial.npz"
+    else:
+        name = f"round_{round_idx:03d}_after_train.npz"
+
+    save_weights(
+        args.weight_log_dir / name,
+        weights,
+        round=round_idx,
+        train_split=args.train_split,
+        train_label=-1 if train_label is None else train_label,
+        train_count=args.train_count,
+        train_offset=-1 if train_offset is None else train_offset,
+        mode=args.mode,
+    )
+
+
+def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
+    import numpy as np
+
+    if args.train_rounds < 1:
+        raise ValueError("--train-rounds must be positive")
+
+    if args.mode == "train":
+        weights, source = load_or_initialize_training_weights(args)
+    else:
+        weights = load_weights(args.weight_file)
+        source = f"loaded from {args.weight_file}"
+
+    print(f"Dataset   : {raw_dir}")
+    print(
+        "Weighted  : "
+        f"mode={args.mode}, weight_file={args.weight_file}, source={source}, "
+        f"rounds={args.train_rounds if args.mode == 'train' else 0}"
+    )
+    print(
+        "TrainCfg  : "
+        f"{weighted_train_config_text(args)}"
+    )
+    print(
+        "QueryCfg  : "
+        f"split={args.test_split}, label={args.test_label}, index={args.test_index}, "
+        f"count={args.test_count}, offset={args.test_offset}"
+    )
+
+    maybe_save_round_weights(args, 0, weights)
+    dma, allocate_fn = prepare_runtime(bit_path, args.dma_ip)
+
+    if args.mode == "train":
+        total_train_ms = 0.0
+        support_cache: dict[tuple[str, int, int], list[tuple[int, np.ndarray]]] = {}
+
+        for round_idx in range(1, args.train_rounds + 1):
+            if args.train_label is None:
+                sample_index = round_training_sample_index(args, round_idx)
+                cache_key = ("balanced", OUTPUT_CLASSES, sample_index)
+                if cache_key not in support_cache:
+                    support_images, _support_paths = build_balanced_support_set(
+                        raw_dir=raw_dir,
+                        split=args.train_split,
+                        sample_index=sample_index,
+                        label_count=OUTPUT_CLASSES,
+                        invert=args.invert,
+                        raw_resize=args.raw_resize,
+                        threshold=args.threshold,
+                        auto_invert=not args.no_auto_invert,
+                    )
+                    support_cache[cache_key] = support_images
+                round_desc = f"balanced=0..9, sample_index={sample_index}"
+                round_train_label = None
+                round_train_offset = sample_index
+            else:
+                support_label = args.train_label
+                support_offset = args.train_offset + (round_idx - 1) * args.train_count
+                cache_key = ("single", support_label, support_offset)
+                if cache_key not in support_cache:
+                    support_images, _support_paths = build_dataset_support_set(
+                        raw_dir=raw_dir,
+                        split=args.train_split,
+                        label=support_label,
+                        train_count=args.train_count,
+                        train_offset=support_offset,
+                        invert=args.invert,
+                        raw_resize=args.raw_resize,
+                        threshold=args.threshold,
+                        auto_invert=not args.no_auto_invert,
+                    )
+                    support_cache[cache_key] = support_images
+                round_desc = f"label={support_label}, offset={support_offset}"
+                round_train_label = support_label
+                round_train_offset = support_offset
+
+            gain = 1.0 if args.gain is None else args.gain
+            scaled_support = [
+                (label, scale_image(image, gain))
+                for label, image in support_cache[cache_key]
+            ]
+
+            before = {key: np.array(value, copy=True) for key, value in weights.items()}
+            weights, latency_ms = run_weighted_train_only(
+                dma=dma,
+                allocate_fn=allocate_fn,
+                weights=weights,
+                support_images=scaled_support,
+                timeout_s=args.timeout_s,
+            )
+            total_train_ms += latency_ms
+            print(
+                f"TrainRound: round={round_idx}, support={round_desc}, "
+                f"time={latency_ms:.3f} ms"
+            )
+            print_weight_delta(round_idx, before, weights)
+            maybe_save_round_weights(
+                args,
+                round_idx,
+                weights,
+                train_label=round_train_label,
+                train_offset=round_train_offset,
+            )
+
+        save_weights(
+            args.weight_file,
+            weights,
+            round=args.train_rounds,
+            train_rounds=args.train_rounds,
+            train_split=args.train_split,
+            train_count=args.train_count,
+            train_offset=args.train_offset,
+            mode="train",
+        )
+        print(
+            f"Weights   : saved final weights to {args.weight_file}, "
+            f"total_train_only_time={total_train_ms:.3f} ms"
+        )
+
+    if args.batch or args.test_count > 1:
+        query_batch = build_dataset_query_batch(
+            raw_dir=raw_dir,
+            split=args.test_split,
+            test_count=args.test_count,
+            test_offset=args.test_offset,
+            invert=args.invert,
+            raw_resize=args.raw_resize,
+            threshold=args.threshold,
+            auto_invert=not args.no_auto_invert,
+        )
+        total_latency_ms = 0.0
+        correct = 0
+        for query_name, query_label, query_image in query_batch:
+            scores, returned_weights, latency_ms, _used_gain = run_weighted_infer_prepared(
+                dma=dma,
+                allocate_fn=allocate_fn,
+                weights=weights,
+                image=query_image,
+                timeout_s=args.timeout_s,
+                gain=args.gain,
+                auto_gain=not args.no_auto_gain,
+            )
+            if int(np.argmax(scores)) == query_label:
+                correct += 1
+            total_latency_ms += latency_ms
+            print_batch_result(query_name, scores, latency_ms, query_label, "infer")
+
+            drift = weight_delta_summary(weights, returned_weights)
+            if any(item["changed"] for item in drift.values()):
+                print("Warning   : weighted infer returned different weights; hardware infer should be read-only")
+
+        avg_latency_ms = total_latency_ms / len(query_batch)
+        print(
+            f"Weighted Summary: correct={correct}/{len(query_batch)}, "
+            f"avg_inference_time={avg_latency_ms:.3f} ms, "
+            f"total_inference_time={total_latency_ms:.3f} ms"
+        )
+        return 0
+
+    query_name, query_image = select_dataset_sample(
+        raw_dir=raw_dir,
+        split=args.test_split,
+        label=args.test_label,
+        index=args.test_index,
+        invert=args.invert,
+        raw_resize=args.raw_resize,
+        threshold=args.threshold,
+        auto_invert=not args.no_auto_invert,
+    )
+    scores, returned_weights, latency_ms, used_gain = run_weighted_infer_prepared(
+        dma=dma,
+        allocate_fn=allocate_fn,
+        weights=weights,
+        image=query_image,
+        timeout_s=args.timeout_s,
+        gain=args.gain,
+        auto_gain=not args.no_auto_gain,
+    )
+    stats = image_stats(query_image, used_gain)
+    print_result(
+        bit_path,
+        query_name,
+        "infer",
+        scores,
+        latency_ms,
+        used_gain,
+        stats,
+        query_image,
+        [],
+        None,
+        None,
+        args.show_pixels,
+    )
+    drift = weight_delta_summary(weights, returned_weights)
+    if any(item["changed"] for item in drift.values()):
+        print("Warning   : weighted infer returned different weights; hardware infer should be read-only")
+    return 0
+
+
 def strip_ipykernel_args(argv: list[str]) -> list[str]:
     cleaned: list[str] = []
     skip_next = False
@@ -1083,6 +1702,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-index", type=int, default=0, help="Index inside the selected query label set")
     parser.add_argument("--test-count", type=int, default=1, help="Number of query samples to test in dataset batch mode")
     parser.add_argument("--test-offset", type=int, default=0, help="Start offset for sequential dataset batch testing")
+    parser.add_argument("--weight-file", type=Path, default=Path("stdp_weights.npz"))
+    parser.add_argument("--weight-log-dir", type=Path, default=Path("weight_logs"))
+    parser.add_argument("--train-rounds", type=int, default=300)
+    parser.add_argument(
+        "--legacy-protocol",
+        action="store_true",
+        help="Use the original MODE_INFER/MODE_TRAIN protocol without PS-supplied persistent weights",
+    )
+    parser.add_argument(
+        "--no-save-every-round",
+        dest="save_every_round",
+        action="store_false",
+        help="Only save the final weight file, not round_XXX logs",
+    )
+    parser.set_defaults(save_every_round=True)
+    parser.add_argument(
+        "--reset-weights",
+        action="store_true",
+        help="Ignore an existing weight file during training and start from PS-generated initial weights",
+    )
     parser.add_argument("--invert", action="store_true", help="Invert grayscale pixels before inference")
     parser.add_argument(
         "--no-auto-invert",
@@ -1121,6 +1760,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--threshold must be in range [0, 255]")
     if args.gain is not None and args.gain <= 0:
         raise ValueError("--gain must be positive")
+    if args.train_rounds < 1:
+        raise ValueError("--train-rounds must be positive")
 
     bit_path = resolve_existing_path(args.bit, default_bit_candidates(), "bitstream")
     dataset_mode = args.dataset or args.raw_dir is not None
@@ -1133,6 +1774,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--test-label must be in range [0, 9]")
         if args.train_label is not None and not (0 <= args.train_label < OUTPUT_CLASSES):
             raise ValueError("--train-label must be in range [0, 9]")
+
+        if not args.legacy_protocol:
+            return run_weighted_dataset_workflow(bit_path, raw_dir, args)
 
         print(f"Dataset   : {raw_dir}")
         print(

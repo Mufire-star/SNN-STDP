@@ -24,6 +24,7 @@ constexpr int T_STEPS = 8;
 constexpr int CONV1_W_SIZE = C1 * 1 * K * K;
 constexpr int CONV2_W_SIZE = C2 * C1 * K * K;
 constexpr int FC_W_SIZE = FC_OUT * FC_IN;
+constexpr int TOTAL_WEIGHT_WORDS = CONV1_W_SIZE + CONV2_W_SIZE + FC_W_SIZE;
 
 // MODE_TRAIN receives NUM_TRAIN_IMG support samples. Each sample is encoded as
 // one label byte followed by one 28x28 image.
@@ -31,6 +32,9 @@ constexpr int NUM_TRAIN_IMG = 10;
 
 constexpr int MODE_INFER = 0;
 constexpr int MODE_TRAIN = 1;
+constexpr int MODE_WEIGHTED_INFER = 2;
+constexpr int MODE_WEIGHTED_TRAIN = 3;
+constexpr int MODE_WEIGHTED_TRAIN_ONLY = 4;
 
 typedef ap_uint<8> pix_t;
 // Keep enough fractional precision so the small deterministic bootstrap
@@ -46,8 +50,8 @@ constexpr int STDP_TAU_PLUS = 4;
 constexpr int STDP_TAU_MINUS = 4;
 const dw_t STDP_A_PLUS = dw_t(0.01);
 const dw_t STDP_A_MINUS = dw_t(0.012);
-const w_t W_MAX = w_t(3.0);
-const w_t W_MIN = w_t(-3.0);
+const w_t W_MAX = w_t(1.0);
+const w_t W_MIN = w_t(-1.0);
 const ts_t TS_NONE = ts_t((1 << 4) - 1);
 
 typedef ap_axiu<8, 0, 0, 0> axis_in_t;

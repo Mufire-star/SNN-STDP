@@ -1,5 +1,5 @@
 ﻿<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
-<EDKSYSTEM EDWVERSION="1.2" TIMESTAMP="Thu May  7 11:27:19 2026" VIVADOVERSION="2025.2">
+<EDKSYSTEM EDWVERSION="1.2" TIMESTAMP="Fri May  8 08:43:10 2026" VIVADOVERSION="2025.2">
 
   <SYSTEMINFO ARCH="zynquplus" DEVICE="xczu7ev" NAME="design_1" PACKAGE="ffvc1156" SPEEDGRADE="-2"/>
 
@@ -2929,10 +2929,10 @@
       <DOCUMENTS/>
       <PARAMETERS>
         <PARAMETER NAME="Component_Name" VALUE="design_1_snn_top_0_0"/>
-        <PARAMETER NAME="II" VALUE="1970831 ~ 63396091"/>
+        <PARAMETER NAME="II" VALUE="3928 ~ 21372326"/>
         <PARAMETER NAME="clk_period" VALUE="10"/>
         <PARAMETER NAME="combinational" VALUE="0"/>
-        <PARAMETER NAME="latency" VALUE="1970830"/>
+        <PARAMETER NAME="latency" VALUE="3927"/>
         <PARAMETER NAME="machine" VALUE="64"/>
         <PARAMETER NAME="EDK_IPTYPE" VALUE="PERIPHERAL"/>
       </PARAMETERS>
@@ -3596,8 +3596,8 @@
         <PARAMETER NAME="PSU_MIO_9_POLARITY" VALUE="Default"/>
         <PARAMETER NAME="PSU_MIO_9_PULLUPDOWN" VALUE="pullup"/>
         <PARAMETER NAME="PSU_MIO_9_SLEW" VALUE="fast"/>
-        <PARAMETER NAME="PSU_MIO_TREE_PERIPHERALS"/>
-        <PARAMETER NAME="PSU_MIO_TREE_SIGNALS"/>
+        <PARAMETER NAME="PSU_MIO_TREE_PERIPHERALS" VALUE="#############################################################################"/>
+        <PARAMETER NAME="PSU_MIO_TREE_SIGNALS" VALUE="#############################################################################"/>
         <PARAMETER NAME="PSU_PERIPHERAL_BOARD_PRESET"/>
         <PARAMETER NAME="PSU_SD0_INTERNAL_BUS_WIDTH" VALUE="8"/>
         <PARAMETER NAME="PSU_SD1_INTERNAL_BUS_WIDTH" VALUE="8"/>
