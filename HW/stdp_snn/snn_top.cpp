@@ -196,6 +196,24 @@ direct_feature_thresholds:
     }
 }
 
+static inline ap_int<12> score_bias(int o)
+{
+#pragma HLS INLINE
+    switch (o)
+    {
+    case 0: return ap_int<12>(-64);
+    case 1: return ap_int<12>(16);
+    case 2: return ap_int<12>(-32);
+    case 3: return ap_int<12>(16);
+    case 4: return ap_int<12>(-8);
+    case 5: return ap_int<12>(-4);
+    case 6: return ap_int<12>(32);
+    case 8: return ap_int<12>(-128);
+    case 9: return ap_int<12>(-14);
+    default: return ap_int<12>(0);
+    }
+}
+
 static inline ap_int<8> read_s8(hls::stream<axis_in_t> &in_stream)
 {
 #pragma HLS INLINE
@@ -964,7 +982,7 @@ output_scores:
                 }
                 ap_fixed<28, 16> scaled =
                     (ap_fixed<28, 16>(score) + ap_fixed<28, 16>(512.0)) *
-                    ap_fixed<28, 16>(4.0);
+                    ap_fixed<28, 16>(4.0) + ap_fixed<28, 16>(score_bias(o));
                 if (scaled <= ap_fixed<28, 16>(0))
                     q = ap_uint<16>(0);
                 else if (scaled >= ap_fixed<28, 16>(4095))

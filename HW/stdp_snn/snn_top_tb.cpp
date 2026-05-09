@@ -123,7 +123,7 @@ static void push_s8(hls::stream<axis_in_t> &in_stream, int8_t value)
 
 static int8_t encode_weight(float value)
 {
-    float scaled = value * 64.0f;
+    float scaled = value * 128.0f;
     int raw = scaled >= 0.0f ? int(scaled + 0.5f) : int(scaled - 0.5f);
     if (raw > 127)
         raw = 127;
@@ -139,7 +139,7 @@ static std::vector<int8_t> initial_weight_words()
 
     for (int idx = 0; idx < CONV1_W_SIZE; idx++)
     {
-        const int bucket = (idx * 11 + 7) % 11;
+        const int bucket = (idx * 5 + 7) % 11;
         const float values[] = {0.035f, 0.039f, 0.043f, 0.047f, 0.051f, 0.055f, 0.059f, 0.063f, 0.067f, 0.071f, 0.075f};
         weights[cursor++] = encode_weight(values[bucket]);
     }
@@ -453,14 +453,21 @@ int main()
     }
 
     int changed_total = 0;
+    int changed_conv1 = 0;
+    int changed_conv2 = 0;
     int changed_fc = 0;
     const int fc_start = CONV1_W_SIZE + CONV2_W_SIZE;
+    const int conv2_start = CONV1_W_SIZE;
     for (int i = 0; i < TOTAL_WEIGHT_WORDS; i++)
     {
         if (weights_before[i] != weights_after[i])
         {
             changed_total++;
-            if (i >= fc_start)
+            if (i < conv2_start)
+                changed_conv1++;
+            else if (i < fc_start)
+                changed_conv2++;
+            else
                 changed_fc++;
         }
     }
@@ -476,6 +483,8 @@ int main()
 
     std::cout << "\n=== Weighted Persistence Protocol Summary ===\n";
     std::cout << "Changed weights total:  " << changed_total << "\n";
+    std::cout << "Changed Conv1 weights:  " << changed_conv1 << "\n";
+    std::cout << "Changed Conv2 weights:  " << changed_conv2 << "\n";
     std::cout << "Changed FC weights:     " << changed_fc << "\n";
     std::cout << "Weighted infer result:  " << pred_weighted << "\n";
     std::cout << "Weighted infer scores:  ";
