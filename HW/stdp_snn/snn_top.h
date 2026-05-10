@@ -25,6 +25,7 @@ constexpr int CONV1_W_SIZE = C1 * 1 * K * K;
 constexpr int CONV2_W_SIZE = C2 * C1 * K * K;
 constexpr int FC_W_SIZE = FC_OUT * FC_IN;
 constexpr int TOTAL_WEIGHT_WORDS = CONV1_W_SIZE + CONV2_W_SIZE + FC_W_SIZE;
+constexpr int TRAIN_DIAG_WORDS = 10;
 
 // MODE_TRAIN receives NUM_TRAIN_IMG support samples. Each sample is encoded as
 // one label byte followed by one 28x28 image.
@@ -39,19 +40,31 @@ constexpr int MODE_WEIGHTED_TRAIN_ONLY = 4;
 typedef ap_uint<8> pix_t;
 // Keep enough fractional precision so the small deterministic bootstrap
 // weights used by the STDP demo do not quantize to zero after HLS lowering.
-typedef ap_fixed<12, 4> w_t;
+typedef ap_fixed<16, 4> w_t;
 typedef ap_fixed<20, 8> acc_t;
 typedef ap_fixed<16, 8> mem_t;
-typedef ap_ufixed<12, 2> dw_t;
+typedef ap_ufixed<20, 2> dw_t;
 typedef ap_uint<4> ts_t;
 typedef ap_uint<5> spike_cnt_t;
 
 constexpr int STDP_TAU_PLUS = 4;
 constexpr int STDP_TAU_MINUS = 4;
-const dw_t STDP_A_PLUS = dw_t(0.01);
-const dw_t STDP_A_MINUS = dw_t(0.012);
+const dw_t STDP_A_PLUS = dw_t(0.0015);
+const dw_t STDP_A_MINUS = dw_t(0.0025);
 const w_t W_MAX = w_t(1.0);
 const w_t W_MIN = w_t(-1.0);
+const w_t CONV_W_MAX = w_t(0.60);
+const w_t CONV_W_MIN = w_t(0.0);
+const w_t FC_ACTIVE_LTP = w_t(0.01171875);
+const w_t FC_INACTIVE_LTD = w_t(0.0009765625);
+const w_t FC_ANTILABEL_LTD = w_t(0.0009765625);
+const w_t FC_BP_ACTIVE_LTP = w_t(0.01171875);
+const w_t FC_BP_WRONG_LTD = w_t(0.01171875);
+const w_t FC_BP_CORRECT_LTP = w_t(0.00390625);
+const dw_t CONV_BP_A_PLUS = dw_t(0.0015);
+const dw_t CONV_BP_A_MINUS = dw_t(0.0035);
+const dw_t CONV_HOMEO = dw_t(0.002);
+const w_t CONV_HOME_OFFSET = w_t(0.16);
 const ts_t TS_NONE = ts_t((1 << 4) - 1);
 
 typedef ap_axiu<8, 0, 0, 0> axis_in_t;

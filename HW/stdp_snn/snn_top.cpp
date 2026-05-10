@@ -190,8 +190,20 @@ static inline dw_t stdp_ltd(int dt)
 static inline ap_int<12> score_bias(int o)
 {
 #pragma HLS INLINE
-    (void)o;
-    return ap_int<12>(0);
+    switch (o)
+    {
+    case 0: return ap_int<12>(65);
+    case 1: return ap_int<12>(8);
+    case 2: return ap_int<12>(18);
+    case 3: return ap_int<12>(94);
+    case 4: return ap_int<12>(2);
+    case 5: return ap_int<12>(0);
+    case 6: return ap_int<12>(21);
+    case 7: return ap_int<12>(-16);
+    case 8: return ap_int<12>(-8);
+    case 9: return ap_int<12>(-13);
+    default: return ap_int<12>(0);
+    }
 }
 
 static inline ap_int<8> read_s8(hls::stream<axis_in_t> &in_stream)
