@@ -195,6 +195,34 @@ static int collect_weights(
     return 0;
 }
 
+static int collect_train_diag(
+    hls::stream<axis_out_t> &out_stream,
+    std::array<int, TRAIN_DIAG_WORDS> &diag,
+    const char *tag)
+{
+    for (int i = 0; i < TRAIN_DIAG_WORDS; i++)
+    {
+        if (out_stream.empty())
+        {
+            std::cerr << tag << ": output stream ended early at diagnostic " << i << "\n";
+            return -1;
+        }
+        axis_out_t o = out_stream.read();
+        diag[i] = int(o.data);
+        if (o.last)
+        {
+            std::cerr << tag << ": unexpected TLAST in diagnostic word " << i << "\n";
+            return -1;
+        }
+    }
+    if (diag[0] != 0xB57D)
+    {
+        std::cerr << tag << ": invalid BP-STDP diagnostic magic " << diag[0] << "\n";
+        return -1;
+    }
+    return 0;
+}
+
 static int run_infer(
     hls::stream<axis_in_t> &in_stream,
     hls::stream<axis_out_t> &out_stream,
@@ -278,6 +306,7 @@ static int run_weighted_train_only(
     const std::vector<int8_t> &weights_in,
     const std::vector<std::vector<unsigned char>> &train_images,
     const std::vector<unsigned char> &train_labels,
+    std::array<int, TRAIN_DIAG_WORDS> &train_diag,
     std::vector<int8_t> &weights_out)
 {
     push_byte(in_stream, MODE_WEIGHTED_TRAIN_ONLY);
@@ -293,6 +322,8 @@ static int run_weighted_train_only(
     }
 
     snn_top(in_stream, out_stream);
+    if (collect_train_diag(out_stream, train_diag, "weighted_train_only") != 0)
+        return -1;
     return collect_weights(out_stream, weights_out, "weighted_train_only");
 }
 
@@ -446,7 +477,8 @@ int main()
     }
 
     std::vector<int8_t> weights_after;
-    if (run_weighted_train_only(in_stream, out_stream, weights_before, train_imgs, train_lbls, weights_after) != 0)
+    std::array<int, TRAIN_DIAG_WORDS> train_diag = {};
+    if (run_weighted_train_only(in_stream, out_stream, weights_before, train_imgs, train_lbls, train_diag, weights_after) != 0)
     {
         std::cerr << "Weighted train-only path failed.\n";
         return 5;
@@ -486,6 +518,16 @@ int main()
     std::cout << "Changed Conv1 weights:  " << changed_conv1 << "\n";
     std::cout << "Changed Conv2 weights:  " << changed_conv2 << "\n";
     std::cout << "Changed FC weights:     " << changed_fc << "\n";
+    std::cout << "BP-STDP diag magic:     0x" << std::hex << train_diag[0] << std::dec << "\n";
+    std::cout << "BP-STDP pre correct/wrong: "
+              << train_diag[1] << "/" << train_diag[2] << "\n";
+    std::cout << "BP-STDP active features: "
+              << train_diag[3] << "\n";
+    std::cout << "BP-STDP local Conv STDP: "
+              << "conv1=" << train_diag[4] << " conv2=" << train_diag[5] << "\n";
+    std::cout << "BP-STDP error feedback: "
+              << "conv1=" << train_diag[6] << " conv2=" << train_diag[7]
+              << " fc_ltp=" << train_diag[8] << " fc_ltd=" << train_diag[9] << "\n";
     std::cout << "Weighted infer result:  " << pred_weighted << "\n";
     std::cout << "Weighted infer scores:  ";
     for (int i = 0; i < FC_OUT; i++)

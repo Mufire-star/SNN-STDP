@@ -35,6 +35,46 @@ static inline w_t clamp_w(w_t w)
     return w;
 }
 
+static inline w_t clamp_conv_w(w_t w)
+{
+#pragma HLS INLINE
+    if (w > CONV_W_MAX)
+        return CONV_W_MAX;
+    if (w < CONV_W_MIN)
+        return CONV_W_MIN;
+    return w;
+}
+
+static inline w_t conv_ltp(w_t w, dw_t dw)
+{
+#pragma HLS INLINE
+    ap_fixed<24, 8> span = ap_fixed<24, 8>(CONV_W_MAX) - ap_fixed<24, 8>(w);
+    ap_fixed<24, 8> delta = ap_fixed<24, 8>(dw) * span;
+    return clamp_conv_w(w + w_t(delta));
+}
+
+static inline w_t conv_ltd(w_t w, dw_t dw)
+{
+#pragma HLS INLINE
+    ap_fixed<24, 8> span = ap_fixed<24, 8>(w) - ap_fixed<24, 8>(CONV_W_MIN);
+    ap_fixed<24, 8> delta = ap_fixed<24, 8>(dw) * span;
+    return clamp_conv_w(w - w_t(delta));
+}
+
+static inline w_t conv_homeo(w_t w, w_t target)
+{
+#pragma HLS INLINE
+    ap_fixed<24, 8> diff = ap_fixed<24, 8>(target) - ap_fixed<24, 8>(w);
+    ap_fixed<24, 8> delta = ap_fixed<24, 8>(CONV_HOMEO) * diff;
+    return clamp_conv_w(w + w_t(delta));
+}
+
+static inline w_t conv_home_target(w_t init_w)
+{
+#pragma HLS INLINE
+    return clamp_conv_w(init_w + CONV_HOME_OFFSET);
+}
+
 // Use deterministic bootstrap weights so the project is self-contained and
 // does not depend on an external supervised checkpoint. The convolutional
 // layers still adapt with unsupervised STDP during MODE_TRAIN; the FC layer
@@ -43,7 +83,7 @@ static inline w_t clamp_w(w_t w)
 static inline w_t init_conv1_weight(int idx)
 {
 #pragma HLS INLINE
-    const int bucket = (idx * 11 + 7) % 11;
+    const int bucket = (idx * 5 + 7) % 11;
     switch (bucket)
     {
     case 0: return w_t(0.035);
@@ -125,13 +165,9 @@ static inline dw_t stdp_ltp(int dt)
 #pragma HLS INLINE
     switch (dt)
     {
-    case 1: return dw_t(0.0075);
-    case 2: return dw_t(0.005625);
-    case 3: return dw_t(0.00421875);
-    case 4: return dw_t(0.0031640625);
-    case 5: return dw_t(0.002373046875);
-    case 6: return dw_t(0.00177978515625);
-    case 7: return dw_t(0.0013348388671875);
+    case 1: return dw_t(0.001);
+    case 2: return dw_t(0.00075);
+    case 3: return dw_t(0.0005);
     default: return dw_t(0);
     }
 }
@@ -141,77 +177,21 @@ static inline dw_t stdp_ltd(int dt)
 #pragma HLS INLINE
     switch (dt)
     {
-    case 1: return dw_t(0.009);
-    case 2: return dw_t(0.00675);
-    case 3: return dw_t(0.0050625);
-    case 4: return dw_t(0.003796875);
-    case 5: return dw_t(0.00284765625);
-    case 6: return dw_t(0.0021357421875);
-    case 7: return dw_t(0.001601806640625);
+    case 1: return dw_t(0.0005);
+    case 2: return dw_t(0.0005);
+    case 3: return dw_t(0.00025);
+    case 4: return dw_t(0.00025);
+    case 5: return dw_t(0.00025);
+    case 6: return dw_t(0.00025);
     default: return dw_t(0);
-    }
-}
-
-static inline ap_uint<8> direct_feature_threshold(int channel)
-{
-#pragma HLS INLINE
-    return (channel == 0) ? ap_uint<8>(16) : ap_uint<8>(64);
-}
-
-static void build_direct_fc_seen(
-    pix_t img[IMG_H][IMG_W],
-    ap_uint<1> fc_seen[FC_IN])
-{
-    constexpr int DIRECT_THRESHOLDS = 2;
-    constexpr int DIRECT_GRID_H = 14;
-    constexpr int DIRECT_GRID_W = 14;
-    constexpr int DIRECT_BLOCK = 2;
-
-direct_feature_thresholds:
-    for (int th = 0; th < DIRECT_THRESHOLDS; th++)
-    {
-    direct_feature_rows:
-        for (int y = 0; y < DIRECT_GRID_H; y++)
-        {
-        direct_feature_cols:
-            for (int x = 0; x < DIRECT_GRID_W; x++)
-            {
-#pragma HLS PIPELINE II = 1
-                ap_uint<10> sum = 0;
-            direct_feature_block_y:
-                for (int dy = 0; dy < DIRECT_BLOCK; dy++)
-                {
-                direct_feature_block_x:
-                    for (int dx = 0; dx < DIRECT_BLOCK; dx++)
-                    {
-                        sum += img[y * DIRECT_BLOCK + dy][x * DIRECT_BLOCK + dx];
-                    }
-                }
-                const int idx = ((th * DIRECT_GRID_H + y) * DIRECT_GRID_W + x);
-                fc_seen[idx] = (sum > ap_uint<10>(direct_feature_threshold(th)) * DIRECT_BLOCK * DIRECT_BLOCK)
-                    ? ap_uint<1>(1)
-                    : ap_uint<1>(0);
-            }
-        }
     }
 }
 
 static inline ap_int<12> score_bias(int o)
 {
 #pragma HLS INLINE
-    switch (o)
-    {
-    case 0: return ap_int<12>(-64);
-    case 1: return ap_int<12>(16);
-    case 2: return ap_int<12>(-32);
-    case 3: return ap_int<12>(16);
-    case 4: return ap_int<12>(-8);
-    case 5: return ap_int<12>(-4);
-    case 6: return ap_int<12>(32);
-    case 8: return ap_int<12>(-128);
-    case 9: return ap_int<12>(-14);
-    default: return ap_int<12>(0);
-    }
+    (void)o;
+    return ap_int<12>(0);
 }
 
 static inline ap_int<8> read_s8(hls::stream<axis_in_t> &in_stream)
@@ -225,21 +205,23 @@ static inline ap_int<8> read_s8(hls::stream<axis_in_t> &in_stream)
 static inline w_t decode_weight_word(ap_int<8> raw)
 {
 #pragma HLS INLINE
-    ap_fixed<24, 16> scaled = ap_fixed<24, 16>(raw) * ap_fixed<24, 16>(0.015625);
+    ap_fixed<24, 16> scaled = ap_fixed<24, 16>(raw) * ap_fixed<24, 16>(0.0078125);
     return w_t(scaled);
 }
 
 static inline ap_uint<16> encode_weight_word(w_t w)
 {
 #pragma HLS INLINE
-    ap_fixed<24, 16> scaled = ap_fixed<24, 16>(w) * ap_fixed<24, 16>(64.0);
+    ap_fixed<24, 16> scaled = ap_fixed<24, 16>(w) * ap_fixed<24, 16>(128.0);
     ap_int<16> raw;
     if (scaled > ap_fixed<24, 16>(127.0))
         raw = ap_int<16>(127);
     else if (scaled < ap_fixed<24, 16>(-128.0))
         raw = ap_int<16>(-128);
+    else if (scaled >= ap_fixed<24, 16>(0.0))
+        raw = ap_int<16>(scaled + ap_fixed<24, 16>(0.5));
     else
-        raw = ap_int<16>(scaled);
+        raw = ap_int<16>(scaled - ap_fixed<24, 16>(0.5));
     ap_int<8> q = ap_int<8>(raw);
     return ap_uint<16>(ap_int<16>(q));
 }
@@ -253,6 +235,13 @@ static inline void write_u16(hls::stream<axis_out_t> &out_stream, ap_uint<16> da
     outp.strb = -1;
     outp.last = last ? 1 : 0;
     out_stream.write(outp);
+}
+
+static inline void diag_inc(ap_uint<16> &v)
+{
+#pragma HLS INLINE
+    if (v != ap_uint<16>(0xFFFF))
+        v++;
 }
 
 void snn_top(hls::stream<axis_in_t> &in_stream, hls::stream<axis_out_t> &out_stream)
@@ -341,12 +330,28 @@ init_fc:
     ap_uint<1> spk3[FC_OUT];
     spike_cnt_t spike_cnt[FC_OUT];
     ap_uint<1> fc_seen[FC_IN];
+    ap_uint<4> fc_count[FC_IN];
     ts_t last_pre_conv1[IMG_H][IMG_W];
     ts_t last_post_conv1[C1][IMG_H][IMG_W];
     ts_t last_pre_conv2[C1][P1_H][P1_W];
     ts_t last_post_conv2[C2][P1_H][P1_W];
     ts_t last_pre_fc[C2][P2_H][P2_W];
     ts_t last_post_fc[FC_OUT];
+    ap_uint<1> conv1_ltp_seen[CONV1_W_SIZE];
+    ap_uint<1> conv1_ltd_seen[CONV1_W_SIZE];
+    ap_uint<1> conv2_ltp_seen[CONV2_W_SIZE];
+    ap_uint<1> conv2_ltd_seen[CONV2_W_SIZE];
+    ap_fixed<24, 12> bp_feedback_c1[C1];
+    ap_fixed<24, 12> bp_feedback_c2[C2];
+    ap_uint<16> diag_correct_pre = 0;
+    ap_uint<16> diag_wrong_pre = 0;
+    ap_uint<16> diag_active_features = 0;
+    ap_uint<16> diag_stdp_conv1 = 0;
+    ap_uint<16> diag_stdp_conv2 = 0;
+    ap_uint<16> diag_bp_conv1 = 0;
+    ap_uint<16> diag_bp_conv2 = 0;
+    ap_uint<16> diag_bp_fc_ltp = 0;
+    ap_uint<16> diag_bp_fc_ltd = 0;
 
     // Keep intermediate spike maps in single-copy memories and reuse them over
     // time instead of letting HLS duplicate arrays for parallel reads.
@@ -359,6 +364,7 @@ init_fc:
 #pragma HLS BIND_STORAGE variable = spk2 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = p2 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = fc_seen type = ram_1p impl = bram
+#pragma HLS BIND_STORAGE variable = fc_count type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_pre_conv1 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_post_conv1 type = ram_1p impl = bram
 #pragma HLS BIND_STORAGE variable = last_pre_conv2 type = ram_1p impl = bram
@@ -440,6 +446,7 @@ init_fc:
             {
 #pragma HLS PIPELINE II = 1
                 fc_seen[i] = ap_uint<1>(0);
+                fc_count[i] = ap_uint<4>(0);
             }
         reset_ts_fc_post:
             for (int o = 0; o < FC_OUT; o++)
@@ -461,13 +468,23 @@ init_fc:
                 }
             }
 
-            if (weighted_mode)
+        reset_conv1_stdp_marks:
+            for (int widx = 0; widx < CONV1_W_SIZE; widx++)
             {
-                build_direct_fc_seen(img, fc_seen);
+#pragma HLS PIPELINE II = 1
+                conv1_ltp_seen[widx] = ap_uint<1>(0);
+                conv1_ltd_seen[widx] = ap_uint<1>(0);
             }
-            else
+        reset_conv2_stdp_marks:
+            for (int widx = 0; widx < CONV2_W_SIZE; widx++)
             {
-                ap_uint<16> lfsr = 0xACE1;
+#pragma HLS PIPELINE II = 1
+                conv2_ltp_seen[widx] = ap_uint<1>(0);
+                conv2_ltd_seen[widx] = ap_uint<1>(0);
+            }
+
+            {
+                ap_uint<16> lfsr = ap_uint<16>(0xACE1u + ap_uint<16>(n * 97));
 
         train_time_loop:
                 for (int t = 0; t < T_STEPS; t++)
@@ -523,24 +540,20 @@ init_fc:
                             ap_uint<1> s = (m >= v_th) ? ap_uint<1>(1) : ap_uint<1>(0);
                             mem1[oc][i][j] = s ? mem_t(m - v_th) : mem_t(m);
                             spk1[oc][i][j] = s;
-                            if (s)
-                                last_post_conv1[oc][i][j] = ts_t(t);
                         }
                     }
                 }
 
-            const bool enable_conv_stdp = false;
+            const bool enable_conv_stdp = true;
             if (enable_conv_stdp)
             {
-            stdp_conv1_ltp:
+            stdp_conv1:
                 for (int oc = 0; oc < C1; oc++)
                 {
                     for (int i = 0; i < IMG_H; i++)
                     {
                         for (int j = 0; j < IMG_W; j++)
                         {
-                            if (!spk1[oc][i][j])
-                                continue;
                             for (int ki = 0; ki < K; ki++)
                             {
                                 for (int kj = 0; kj < K; kj++)
@@ -550,17 +563,35 @@ init_fc:
                                     if (ii >= 0 && ii < IMG_H && jj >= 0 && jj < IMG_W)
                                     {
                                         int widx = idx_conv1(oc, ki, kj);
-                                        if (in_spk[ii][jj])
+                                        if (spk1[oc][i][j])
                                         {
-                                            rw_conv1_w[widx] = clamp_w(rw_conv1_w[widx] + w_t(STDP_A_PLUS));
+                                            if (in_spk[ii][jj] && !conv1_ltp_seen[widx])
+                                            {
+                                                rw_conv1_w[widx] = conv_ltp(rw_conv1_w[widx], STDP_A_PLUS);
+                                                conv1_ltp_seen[widx] = ap_uint<1>(1);
+                                                diag_inc(diag_stdp_conv1);
+                                            }
+                                            else if (last_pre_conv1[ii][jj] != TS_NONE && !conv1_ltp_seen[widx])
+                                            {
+                                                int dt = t - int(last_pre_conv1[ii][jj]);
+                                                if (dt > 0 && dt < T_STEPS)
+                                                {
+                                                    dw_t dw = stdp_ltp(dt);
+                                                    rw_conv1_w[widx] = conv_ltp(rw_conv1_w[widx], dw);
+                                                    conv1_ltp_seen[widx] = ap_uint<1>(1);
+                                                    diag_inc(diag_stdp_conv1);
+                                                }
+                                            }
                                         }
-                                        else if (last_pre_conv1[ii][jj] != TS_NONE)
+                                        if (in_spk[ii][jj] && last_post_conv1[oc][i][j] != TS_NONE && !conv1_ltd_seen[widx])
                                         {
-                                            int dt = t - int(last_pre_conv1[ii][jj]);
+                                            int dt = t - int(last_post_conv1[oc][i][j]);
                                             if (dt > 0 && dt < T_STEPS)
                                             {
-                                                dw_t dw = stdp_ltp(dt);
-                                                rw_conv1_w[widx] = clamp_w(rw_conv1_w[widx] + w_t(dw));
+                                                dw_t dw = stdp_ltd(dt);
+                                                rw_conv1_w[widx] = conv_ltd(rw_conv1_w[widx], dw);
+                                                conv1_ltd_seen[widx] = ap_uint<1>(1);
+                                                diag_inc(diag_stdp_conv1);
                                             }
                                         }
                                     }
@@ -570,6 +601,20 @@ init_fc:
                     }
                 }
             }
+
+            commit_post_conv1:
+                for (int oc = 0; oc < C1; oc++)
+                {
+                    for (int i = 0; i < IMG_H; i++)
+                    {
+                        for (int j = 0; j < IMG_W; j++)
+                        {
+#pragma HLS PIPELINE II = 1
+                            if (spk1[oc][i][j])
+                                last_post_conv1[oc][i][j] = ts_t(t);
+                        }
+                    }
+                }
 
             pool1_train:
                 for (int oc = 0; oc < C1; oc++)
@@ -635,23 +680,19 @@ init_fc:
                             ap_uint<1> s = (m >= v_th) ? ap_uint<1>(1) : ap_uint<1>(0);
                             mem2[oc][i][j] = s ? mem_t(m - v_th) : mem_t(m);
                             spk2[oc][i][j] = s;
-                            if (s)
-                                last_post_conv2[oc][i][j] = ts_t(t);
                         }
                     }
                 }
 
             if (enable_conv_stdp)
             {
-            stdp_conv2_ltp:
+            stdp_conv2:
                 for (int oc = 0; oc < C2; oc++)
                 {
                     for (int i = 0; i < P1_H; i++)
                     {
                         for (int j = 0; j < P1_W; j++)
                         {
-                            if (!spk2[oc][i][j])
-                                continue;
                             for (int ic = 0; ic < C1; ic++)
                             {
                                 for (int ki = 0; ki < K; ki++)
@@ -663,17 +704,35 @@ init_fc:
                                         if (ii >= 0 && ii < P1_H && jj >= 0 && jj < P1_W)
                                         {
                                             int widx = idx_conv2(oc, ic, ki, kj);
-                                            if (p1[ic][ii][jj])
+                                            if (spk2[oc][i][j])
                                             {
-                                                rw_conv2_w[widx] = clamp_w(rw_conv2_w[widx] + w_t(STDP_A_PLUS));
+                                                if (p1[ic][ii][jj] && !conv2_ltp_seen[widx])
+                                                {
+                                                    rw_conv2_w[widx] = conv_ltp(rw_conv2_w[widx], STDP_A_PLUS);
+                                                    conv2_ltp_seen[widx] = ap_uint<1>(1);
+                                                    diag_inc(diag_stdp_conv2);
+                                                }
+                                                else if (last_pre_conv2[ic][ii][jj] != TS_NONE && !conv2_ltp_seen[widx])
+                                                {
+                                                    int dt = t - int(last_pre_conv2[ic][ii][jj]);
+                                                    if (dt > 0 && dt < T_STEPS)
+                                                    {
+                                                        dw_t dw = stdp_ltp(dt);
+                                                        rw_conv2_w[widx] = conv_ltp(rw_conv2_w[widx], dw);
+                                                        conv2_ltp_seen[widx] = ap_uint<1>(1);
+                                                        diag_inc(diag_stdp_conv2);
+                                                    }
+                                                }
                                             }
-                                            else if (last_pre_conv2[ic][ii][jj] != TS_NONE)
+                                            if (p1[ic][ii][jj] && last_post_conv2[oc][i][j] != TS_NONE && !conv2_ltd_seen[widx])
                                             {
-                                                int dt = t - int(last_pre_conv2[ic][ii][jj]);
+                                                int dt = t - int(last_post_conv2[oc][i][j]);
                                                 if (dt > 0 && dt < T_STEPS)
                                                 {
-                                                    dw_t dw = stdp_ltp(dt);
-                                                    rw_conv2_w[widx] = clamp_w(rw_conv2_w[widx] + w_t(dw));
+                                                    dw_t dw = stdp_ltd(dt);
+                                                    rw_conv2_w[widx] = conv_ltd(rw_conv2_w[widx], dw);
+                                                    conv2_ltd_seen[widx] = ap_uint<1>(1);
+                                                    diag_inc(diag_stdp_conv2);
                                                 }
                                             }
                                         }
@@ -684,6 +743,20 @@ init_fc:
                     }
                 }
             }
+
+            commit_post_conv2:
+                for (int oc = 0; oc < C2; oc++)
+                {
+                    for (int i = 0; i < P1_H; i++)
+                    {
+                        for (int j = 0; j < P1_W; j++)
+                        {
+#pragma HLS PIPELINE II = 1
+                            if (spk2[oc][i][j])
+                                last_post_conv2[oc][i][j] = ts_t(t);
+                        }
+                    }
+                }
 
             pool2_train:
                 for (int oc = 0; oc < C2; oc++)
@@ -718,6 +791,8 @@ init_fc:
                                 last_pre_fc[oc][i][j] = ts_t(t);
                                 const int idx = ((oc * P2_H + i) * P2_W + j);
                                 fc_seen[idx] = ap_uint<1>(1);
+                                if (fc_count[idx] != ap_uint<4>(15))
+                                    fc_count[idx]++;
                             }
                         }
                     }
@@ -725,13 +800,202 @@ init_fc:
                 }
             }
 
-        prototype_fc_update:
+        bp_reset_feedback_c2:
+            for (int oc = 0; oc < C2; oc++)
+            {
+#pragma HLS PIPELINE II = 1
+                bp_feedback_c2[oc] = ap_fixed<24, 12>(0);
+            }
+        bp_reset_feedback_c1:
+            for (int ic = 0; ic < C1; ic++)
+            {
+#pragma HLS PIPELINE II = 1
+                bp_feedback_c1[ic] = ap_fixed<24, 12>(0);
+            }
+
+            int pred_label = 0;
+            ap_fixed<28, 16> best_score = ap_fixed<28, 16>(-32768);
+
+        bp_score_train_sample:
+            for (int o = 0; o < FC_OUT; o++)
+            {
+                ap_fixed<24, 12> active_score = ap_fixed<24, 12>(0);
+                ap_fixed<24, 12> row_sum = ap_fixed<24, 12>(0);
+                ap_uint<10> active_count = ap_uint<10>(0);
+                for (int idx = 0; idx < FC_IN; idx++)
+                {
+#pragma HLS PIPELINE II = 1
+                    ap_fixed<24, 12> w = ap_fixed<24, 12>(rw_fc_w[idx_fc(o, idx)]);
+                    row_sum += w;
+                    if (fc_seen[idx])
+                    {
+                        active_score += w;
+                        active_count++;
+                    }
+                }
+                ap_fixed<28, 16> mean_active =
+                    (ap_fixed<28, 16>(row_sum) * ap_fixed<28, 16>(active_count)) /
+                    ap_fixed<28, 16>(FC_IN);
+                ap_fixed<28, 16> centered_score =
+                    ap_fixed<28, 16>(active_score) - mean_active;
+                if (o == 0 || centered_score > best_score)
+                {
+                    best_score = centered_score;
+                    pred_label = o;
+                }
+            }
+
+            const bool bp_correct = (pred_label == int(train_label));
+            if (bp_correct)
+                diag_inc(diag_correct_pre);
+            else
+                diag_inc(diag_wrong_pre);
+
+        bp_active_feature_count:
             for (int idx = 0; idx < FC_IN; idx++)
             {
 #pragma HLS PIPELINE II = 1
-                const w_t delta = fc_seen[idx] ? w_t(0.03125) : w_t(-0.03125);
-                int widx = idx_fc(int(train_label), idx);
-                rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + delta);
+                if (fc_seen[idx])
+                    diag_inc(diag_active_features);
+            }
+
+        bp_feedback_from_fc:
+            for (int oc = 0; oc < C2; oc++)
+            {
+                for (int i = 0; i < P2_H; i++)
+                {
+                    for (int j = 0; j < P2_W; j++)
+                    {
+#pragma HLS PIPELINE II = 1
+                        const int idx = ((oc * P2_H + i) * P2_W + j);
+                        if (fc_seen[idx] && !bp_correct)
+                        {
+                            ap_fixed<24, 12> fb =
+                                ap_fixed<24, 12>(rw_fc_w[idx_fc(int(train_label), idx)]);
+                            fb -= ap_fixed<24, 12>(rw_fc_w[idx_fc(pred_label, idx)]);
+                            bp_feedback_c2[oc] += fb;
+                        }
+                    }
+                }
+            }
+
+        bp_feedback_to_conv1:
+            for (int oc = 0; oc < C2; oc++)
+            {
+                for (int ic = 0; ic < C1; ic++)
+                {
+                    for (int ki = 0; ki < K; ki++)
+                    {
+                        for (int kj = 0; kj < K; kj++)
+                        {
+#pragma HLS PIPELINE II = 1
+                            int widx = idx_conv2(oc, ic, ki, kj);
+                            bp_feedback_c1[ic] +=
+                                bp_feedback_c2[oc] * ap_fixed<24, 12>(rw_conv2_w[widx]);
+                        }
+                    }
+                }
+            }
+
+        bp_stdp_fc_update:
+            for (int o = 0; o < FC_OUT; o++)
+            {
+                for (int idx = 0; idx < FC_IN; idx++)
+                {
+#pragma HLS PIPELINE II = 1
+                    int widx = idx_fc(o, idx);
+                    if (o == int(train_label))
+                    {
+                        w_t delta = -FC_INACTIVE_LTD;
+                        if (fc_seen[idx])
+                        {
+                            delta = FC_ACTIVE_LTP + (bp_correct ? FC_BP_CORRECT_LTP : FC_BP_ACTIVE_LTP);
+                            diag_inc(diag_bp_fc_ltp);
+                        }
+                        else
+                        {
+                            diag_inc(diag_bp_fc_ltd);
+                        }
+                        rw_fc_w[widx] = clamp_w(rw_fc_w[widx] + delta);
+                    }
+                    else if (fc_seen[idx] && !bp_correct && o == pred_label)
+                    {
+                        rw_fc_w[widx] = clamp_w(rw_fc_w[widx] - (FC_ANTILABEL_LTD + FC_BP_WRONG_LTD));
+                        diag_inc(diag_bp_fc_ltd);
+                    }
+                    else if (fc_seen[idx])
+                    {
+                        rw_fc_w[widx] = clamp_w(rw_fc_w[widx] - FC_ANTILABEL_LTD);
+                        diag_inc(diag_bp_fc_ltd);
+                    }
+                }
+            }
+
+        bp_stdp_conv2_update:
+            for (int oc = 0; oc < C2; oc++)
+            {
+                for (int ic = 0; ic < C1; ic++)
+                {
+                    for (int ki = 0; ki < K; ki++)
+                    {
+                        for (int kj = 0; kj < K; kj++)
+                        {
+#pragma HLS PIPELINE II = 1
+                            int widx = idx_conv2(oc, ic, ki, kj);
+                            if (conv2_ltp_seen[widx] || conv2_ltd_seen[widx])
+                            {
+                                if (bp_feedback_c2[oc] > ap_fixed<24, 12>(0.00390625))
+                                {
+                                    rw_conv2_w[widx] = conv_ltp(rw_conv2_w[widx], CONV_BP_A_PLUS);
+                                    diag_inc(diag_bp_conv2);
+                                }
+                                else if (bp_feedback_c2[oc] < ap_fixed<24, 12>(-0.00390625))
+                                {
+                                    rw_conv2_w[widx] = conv_ltd(rw_conv2_w[widx], CONV_BP_A_MINUS);
+                                    diag_inc(diag_bp_conv2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        bp_stdp_conv1_update:
+            for (int oc = 0; oc < C1; oc++)
+            {
+                for (int ki = 0; ki < K; ki++)
+                {
+                    for (int kj = 0; kj < K; kj++)
+                    {
+#pragma HLS PIPELINE II = 1
+                        int widx = idx_conv1(oc, ki, kj);
+                        if (conv1_ltp_seen[widx] || conv1_ltd_seen[widx])
+                        {
+                            if (bp_feedback_c1[oc] > ap_fixed<24, 12>(0.00390625))
+                            {
+                                rw_conv1_w[widx] = conv_ltp(rw_conv1_w[widx], CONV_BP_A_PLUS);
+                                diag_inc(diag_bp_conv1);
+                            }
+                            else if (bp_feedback_c1[oc] < ap_fixed<24, 12>(-0.00390625))
+                            {
+                                rw_conv1_w[widx] = conv_ltd(rw_conv1_w[widx], CONV_BP_A_MINUS);
+                                diag_inc(diag_bp_conv1);
+                            }
+                        }
+                    }
+                }
+            }
+        conv1_homeostasis:
+            for (int widx = 0; widx < CONV1_W_SIZE; widx++)
+            {
+#pragma HLS PIPELINE II = 1
+                rw_conv1_w[widx] = conv_homeo(rw_conv1_w[widx], conv_home_target(init_conv1_weight(widx)));
+            }
+        conv2_homeostasis:
+            for (int widx = 0; widx < CONV2_W_SIZE; widx++)
+            {
+#pragma HLS PIPELINE II = 1
+                rw_conv2_w[widx] = conv_homeo(rw_conv2_w[widx], conv_home_target(init_conv2_weight(widx)));
             }
         }
     }
@@ -778,6 +1042,7 @@ infer_reset_fc_seen:
     {
 #pragma HLS PIPELINE II = 1
         fc_seen[i] = ap_uint<1>(0);
+        fc_count[i] = ap_uint<4>(0);
     }
 
     load_infer_img:
@@ -791,11 +1056,6 @@ infer_reset_fc_seen:
         }
     }
 
-    if (weighted_mode)
-    {
-        build_direct_fc_seen(img, fc_seen);
-    }
-    else
     {
         ap_uint<16> lfsr = 0xACE1;
 
@@ -920,6 +1180,8 @@ infer_reset_fc_seen:
                         {
                             const int idx = ((oc * P2_H + i) * P2_W + j);
                             fc_seen[idx] = ap_uint<1>(1);
+                            if (fc_count[idx] != ap_uint<4>(15))
+                                fc_count[idx]++;
                         }
                     }
                 }
@@ -972,17 +1234,34 @@ output_scores:
             ap_uint<16> q = (ap_uint<16>(spike_cnt[o]) * 256) / T_STEPS;
             if (weighted_mode)
             {
-                ap_fixed<24, 12> score = ap_fixed<24, 12>(0);
+                ap_fixed<24, 12> active_score = ap_fixed<24, 12>(0);
+                ap_fixed<24, 12> row_sum = ap_fixed<24, 12>(0);
+                ap_fixed<24, 12> active_mass = ap_fixed<24, 12>(0);
                 for (int idx = 0; idx < FC_IN; idx++)
                 {
-                    if (fc_seen[idx])
-                        score += ap_fixed<24, 12>(rw_fc_w[idx_fc(o, idx)]);
-                    else
-                        score -= ap_fixed<24, 12>(rw_fc_w[idx_fc(o, idx)]);
+                    ap_fixed<24, 12> w = ap_fixed<24, 12>(rw_fc_w[idx_fc(o, idx)]);
+                    row_sum += w;
+                    if (fc_count[idx] != ap_uint<4>(0))
+                    {
+                        ap_fixed<24, 12> mass = ap_fixed<24, 12>(1.0);
+                        if (fc_count[idx] > ap_uint<4>(1))
+                        {
+                            mass += ap_fixed<24, 12>(fc_count[idx] - ap_uint<4>(1)) *
+                                    ap_fixed<24, 12>(0.25);
+                        }
+                        active_score += w * mass;
+                        active_mass += mass;
+                    }
                 }
+                ap_fixed<28, 16> mean_active =
+                    (ap_fixed<28, 16>(row_sum) * ap_fixed<28, 16>(active_mass)) /
+                    ap_fixed<28, 16>(FC_IN);
+                ap_fixed<28, 16> centered_score =
+                    ap_fixed<28, 16>(active_score) - mean_active;
                 ap_fixed<28, 16> scaled =
-                    (ap_fixed<28, 16>(score) + ap_fixed<28, 16>(512.0)) *
-                    ap_fixed<28, 16>(4.0) + ap_fixed<28, 16>(score_bias(o));
+                    ap_fixed<28, 16>(2048.0) +
+                    centered_score * ap_fixed<28, 16>(8.0) +
+                    ap_fixed<28, 16>(score_bias(o));
                 if (scaled <= ap_fixed<28, 16>(0))
                     q = ap_uint<16>(0);
                 else if (scaled >= ap_fixed<28, 16>(4095))
@@ -997,6 +1276,19 @@ output_scores:
 
     if (weighted_mode)
     {
+        if (train_mode)
+        {
+            write_u16(out_stream, ap_uint<16>(0xB57D), false);
+            write_u16(out_stream, diag_correct_pre, false);
+            write_u16(out_stream, diag_wrong_pre, false);
+            write_u16(out_stream, diag_active_features, false);
+            write_u16(out_stream, diag_stdp_conv1, false);
+            write_u16(out_stream, diag_stdp_conv2, false);
+            write_u16(out_stream, diag_bp_conv1, false);
+            write_u16(out_stream, diag_bp_conv2, false);
+            write_u16(out_stream, diag_bp_fc_ltp, false);
+            write_u16(out_stream, diag_bp_fc_ltd, false);
+        }
 dump_conv1:
         for (int i = 0; i < CONV1_W_SIZE; i++)
         {

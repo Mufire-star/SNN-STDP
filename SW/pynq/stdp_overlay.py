@@ -28,10 +28,18 @@ CONV1_W_SIZE = C1 * K * K
 CONV2_W_SIZE = C2 * C1 * K * K
 FC_W_SIZE = OUTPUT_CLASSES * FC_IN
 TOTAL_WEIGHT_WORDS = CONV1_W_SIZE + CONV2_W_SIZE + FC_W_SIZE
+TRAIN_DIAG_WORDS = 10
+TRAIN_DIAG_MAGIC = 0xB57D
 WEIGHT_BYTES = TOTAL_WEIGHT_WORDS
-WEIGHT_SCALE = 64.0
+WEIGHT_SCALE = 128.0
+CONV_W_MIN = 0.0
+CONV_W_MAX = 0.60
+FC_W_MIN = -1.0
+FC_W_MAX = 1.0
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 DEFAULT_GAINS = (1.0, 0.75, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08)
+DEFAULT_WEIGHTED_TRAIN_GAIN = 0.65
+DEFAULT_WEIGHTED_INFER_GAIN = 0.68
 MNIST_SPLIT_FILES = {
     "train": ("train-images-idx3-ubyte", "train-labels-idx1-ubyte"),
     "test": ("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte"),
@@ -59,6 +67,7 @@ NOTEBOOK_WEIGHT_LOG_DIR = "weight_logs"
 NOTEBOOK_TRAIN_ROUNDS = 300
 NOTEBOOK_SAVE_EVERY_ROUND = True
 NOTEBOOK_RESET_WEIGHTS = False
+NOTEBOOK_WEIGHT_ABLATION = "none"
 NOTEBOOK_GAIN: float | None = None
 NOTEBOOK_BIT: str | None = None
 NOTEBOOK_IMAGE: str | None = None
@@ -249,6 +258,7 @@ def notebook_default_argv() -> list[str]:
         argv.extend(["--weight-file", NOTEBOOK_WEIGHT_FILE])
         argv.extend(["--weight-log-dir", NOTEBOOK_WEIGHT_LOG_DIR])
         argv.extend(["--train-rounds", str(NOTEBOOK_TRAIN_ROUNDS)])
+        argv.extend(["--weight-ablation", NOTEBOOK_WEIGHT_ABLATION])
         if NOTEBOOK_TRAIN_LABEL is not None:
             argv.extend(["--train-label", str(NOTEBOOK_TRAIN_LABEL)])
         if NOTEBOOK_BATCH or NOTEBOOK_TEST_COUNT > 1:
@@ -731,7 +741,7 @@ def build_train_payload(
 
 
 def init_conv1_weight_value(idx: int) -> float:
-    bucket = (idx * 11 + 7) % 11
+    bucket = (idx * 5 + 7) % 11
     values = (0.035, 0.039, 0.043, 0.047, 0.051, 0.055, 0.059, 0.063, 0.067, 0.071, 0.075)
     return values[bucket]
 
@@ -758,6 +768,14 @@ def initial_weights() -> dict[str, np.ndarray]:
         key: (np.rint(value * WEIGHT_SCALE) / WEIGHT_SCALE).astype(np.float32)
         for key, value in weights.items()
     }
+
+
+def quantize_weight_values(values):
+    import numpy as np
+
+    raw = np.rint(values.astype(np.float32, copy=False) * WEIGHT_SCALE)
+    raw = np.clip(raw, -128, 127)
+    return (raw / WEIGHT_SCALE).astype(np.float32, copy=False)
 
 
 def validate_weights(weights: dict[str, np.ndarray]) -> None:
@@ -855,10 +873,17 @@ def weight_delta_summary(before: dict[str, np.ndarray], after: dict[str, np.ndar
     for key in ("conv1", "conv2", "fc"):
         delta = after[key] - before[key]
         changed = np.abs(delta) > 0
+        lower = CONV_W_MIN if key.startswith("conv") else FC_W_MIN
+        upper = CONV_W_MAX if key.startswith("conv") else FC_W_MAX
+        tol = 1.0 / WEIGHT_SCALE
         summary[key] = {
             "changed": int(np.count_nonzero(changed)),
             "max_abs_delta": float(np.max(np.abs(delta))) if delta.size else 0.0,
             "mean_abs_delta": float(np.mean(np.abs(delta))) if delta.size else 0.0,
+            "min_weight": float(np.min(after[key])) if after[key].size else 0.0,
+            "max_weight": float(np.max(after[key])) if after[key].size else 0.0,
+            "sat_min": int(np.count_nonzero(after[key] <= lower + tol)),
+            "sat_max": int(np.count_nonzero(after[key] >= upper - tol)),
         }
     return summary
 
@@ -888,9 +913,22 @@ def print_weight_delta(round_idx: int, before: dict[str, np.ndarray], after: dic
         print(
             f"  {layer:<5} changed={item['changed']}, "
             f"max_abs_delta={item['max_abs_delta']:.6f}, "
-            f"mean_abs_delta={item['mean_abs_delta']:.6f}"
+            f"mean_abs_delta={item['mean_abs_delta']:.6f}, "
+            f"range=[{item['min_weight']:.6f},{item['max_weight']:.6f}], "
+            f"sat_min={item['sat_min']}, sat_max={item['sat_max']}"
         )
     print(f"  first_changed_fc={changed_fc}")
+
+
+def print_train_diag(diag: dict[str, int]) -> None:
+    print(
+        "BP-STDP  : "
+        f"pre_correct={diag['correct_pre']}, pre_wrong={diag['wrong_pre']}, "
+        f"active_features={diag['active_features']}, "
+        f"stdp_conv1={diag['stdp_conv1']}, stdp_conv2={diag['stdp_conv2']}, "
+        f"bp_conv1={diag['bp_conv1']}, bp_conv2={diag['bp_conv2']}, "
+        f"bp_fc_ltp={diag['bp_fc_ltp']}, bp_fc_ltd={diag['bp_fc_ltd']}"
+    )
 
 
 def build_weighted_infer_payload(weights: dict[str, np.ndarray], image: np.ndarray) -> np.ndarray:
@@ -947,12 +985,35 @@ def parse_weighted_infer_output(words: np.ndarray) -> tuple[np.ndarray, dict[str
     return scores, weights
 
 
-def parse_weighted_train_only_output(words: np.ndarray) -> dict[str, np.ndarray]:
-    if words.shape != (TOTAL_WEIGHT_WORDS,):
+def parse_train_diag(words: np.ndarray) -> dict[str, int]:
+    if int(words[0]) != TRAIN_DIAG_MAGIC:
         raise RuntimeError(
-            f"invalid weighted train-only output shape {words.shape}, expected {(TOTAL_WEIGHT_WORDS,)}"
+            f"invalid BP-STDP train diagnostic magic 0x{int(words[0]):04x}, "
+            f"expected 0x{TRAIN_DIAG_MAGIC:04x}"
         )
-    return decode_weight_words(words)
+    names = (
+        "correct_pre",
+        "wrong_pre",
+        "active_features",
+        "stdp_conv1",
+        "stdp_conv2",
+        "bp_conv1",
+        "bp_conv2",
+        "bp_fc_ltp",
+        "bp_fc_ltd",
+    )
+    return {name: int(words[idx + 1]) for idx, name in enumerate(names)}
+
+
+def parse_weighted_train_only_output(words: np.ndarray) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    expected = TRAIN_DIAG_WORDS + TOTAL_WEIGHT_WORDS
+    if words.shape != (expected,):
+        raise RuntimeError(
+            f"invalid weighted train-only output shape {words.shape}, expected {(expected,)}"
+        )
+    diag = parse_train_diag(words[:TRAIN_DIAG_WORDS])
+    weights = decode_weight_words(words[TRAIN_DIAG_WORDS:])
+    return weights, diag
 
 
 def run_weighted_train_only(
@@ -961,7 +1022,7 @@ def run_weighted_train_only(
     weights: dict[str, np.ndarray],
     support_images: list[tuple[int, np.ndarray]],
     timeout_s: float,
-) -> tuple[dict[str, np.ndarray], float]:
+) -> tuple[dict[str, np.ndarray], dict[str, int], float]:
     payload = build_weighted_train_only_payload(weights, support_images)
     t0 = time.perf_counter()
     words = run_payload(
@@ -969,10 +1030,11 @@ def run_weighted_train_only(
         allocate_fn,
         payload,
         timeout_s=timeout_s,
-        output_words=TOTAL_WEIGHT_WORDS,
+        output_words=TRAIN_DIAG_WORDS + TOTAL_WEIGHT_WORDS,
     )
     latency_ms = (time.perf_counter() - t0) * 1e3
-    return parse_weighted_train_only_output(words), latency_ms
+    weights_out, diag = parse_weighted_train_only_output(words)
+    return weights_out, diag, latency_ms
 
 
 def run_weighted_infer_prepared(
@@ -988,9 +1050,8 @@ def run_weighted_infer_prepared(
         gains = [gain]
     else:
         # Persistent weighted inference must use the same pixel scale that was
-        # used while training the saved weights. The legacy auto-gain sweep can
-        # change binary direct features and make the classifier pick a different
-        # class for the wrong reason.
+        # used while training the saved weights. A gain sweep would change the
+        # spike statistics seen by the trained synapses.
         gains = [1.0]
 
     attempts: list[tuple[float, np.ndarray, dict[str, np.ndarray], float]] = []
@@ -1395,6 +1456,54 @@ def load_or_initialize_training_weights(args) -> tuple[dict[str, np.ndarray], st
     return initial_weights(), "generated in PS"
 
 
+def weights_for_inference(weights: dict[str, np.ndarray], args) -> tuple[dict[str, np.ndarray], str]:
+    import numpy as np
+
+    mode = args.weight_ablation
+    if mode == "none":
+        return apply_inference_weight_norm(weights, args, "trained")
+
+    if mode == "initial":
+        return apply_inference_weight_norm(initial_weights(), args, "initial")
+
+    ablated = {key: np.array(value, copy=True) for key, value in weights.items()}
+    if mode == "zero-fc":
+        ablated["fc"][:] = 0.0
+        return apply_inference_weight_norm(ablated, args, "zero-fc")
+
+    if mode == "shuffle-fc":
+        rng = np.random.default_rng(args.ablation_seed)
+        fc = np.array(ablated["fc"], copy=True)
+        rng.shuffle(fc)
+        ablated["fc"] = fc
+        return apply_inference_weight_norm(ablated, args, f"shuffle-fc(seed={args.ablation_seed})")
+
+    raise ValueError(f"unknown weight ablation mode: {mode}")
+
+
+def apply_inference_weight_norm(
+    weights: dict[str, np.ndarray],
+    args,
+    source: str,
+) -> tuple[dict[str, np.ndarray], str]:
+    import numpy as np
+
+    mode = args.fc_row_norm
+    if mode == "none":
+        return weights, source
+
+    normalized = {key: np.array(value, copy=True) for key, value in weights.items()}
+    if mode == "unitstd":
+        fc = normalized["fc"].reshape(OUTPUT_CLASSES, FC_IN)
+        centered = fc - fc.mean(axis=1, keepdims=True)
+        std = centered.std(axis=1, keepdims=True)
+        scale = np.where(std > 1e-6, args.fc_row_norm_std / std, 0.0)
+        normalized["fc"] = quantize_weight_values((centered * scale).reshape(FC_W_SIZE))
+        return normalized, f"{source}+fc-row-unitstd({args.fc_row_norm_std:g})"
+
+    raise ValueError(f"unknown FC row normalization mode: {mode}")
+
+
 def maybe_save_round_weights(
     args,
     round_idx: int,
@@ -1505,7 +1614,7 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
             ]
 
             before = {key: np.array(value, copy=True) for key, value in weights.items()}
-            weights, latency_ms = run_weighted_train_only(
+            weights, train_diag, latency_ms = run_weighted_train_only(
                 dma=dma,
                 allocate_fn=allocate_fn,
                 weights=weights,
@@ -1518,6 +1627,7 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
                 f"time={latency_ms:.3f} ms"
             )
             print_weight_delta(round_idx, before, weights)
+            print_train_diag(train_diag)
             maybe_save_round_weights(
                 args,
                 round_idx,
@@ -1541,6 +1651,10 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
             f"total_train_only_time={total_train_ms:.3f} ms"
         )
 
+    infer_weights, infer_weight_source = weights_for_inference(weights, args)
+    if args.weight_ablation != "none":
+        print(f"Ablation  : inference uses {infer_weight_source} weights; saved weights are unchanged")
+
     if args.batch or args.test_count > 1:
         query_batch = build_dataset_query_batch(
             raw_dir=raw_dir,
@@ -1558,7 +1672,7 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
             scores, returned_weights, latency_ms, _used_gain = run_weighted_infer_prepared(
                 dma=dma,
                 allocate_fn=allocate_fn,
-                weights=weights,
+                weights=infer_weights,
                 image=query_image,
                 timeout_s=args.timeout_s,
                 gain=args.gain,
@@ -1569,7 +1683,7 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
             total_latency_ms += latency_ms
             print_batch_result(query_name, scores, latency_ms, query_label, "infer")
 
-            drift = weight_delta_summary(weights, returned_weights)
+            drift = weight_delta_summary(infer_weights, returned_weights)
             if any(item["changed"] for item in drift.values()):
                 print("Warning   : weighted infer returned different weights; hardware infer should be read-only")
 
@@ -1594,7 +1708,7 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
     scores, returned_weights, latency_ms, used_gain = run_weighted_infer_prepared(
         dma=dma,
         allocate_fn=allocate_fn,
-        weights=weights,
+        weights=infer_weights,
         image=query_image,
         timeout_s=args.timeout_s,
         gain=args.gain,
@@ -1615,7 +1729,7 @@ def run_weighted_dataset_workflow(bit_path: Path, raw_dir: Path, args) -> int:
         None,
         args.show_pixels,
     )
-    drift = weight_delta_summary(weights, returned_weights)
+    drift = weight_delta_summary(infer_weights, returned_weights)
     if any(item["changed"] for item in drift.values()):
         print("Warning   : weighted infer returned different weights; hardware infer should be read-only")
     return 0
@@ -1692,7 +1806,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Directory containing labeled support images named 0.jpg ... 9.jpg",
     )
     parser.add_argument("--dma-ip", default="axi_dma_0")
-    parser.add_argument("--timeout-s", type=float, default=5.0)
+    parser.add_argument("--timeout-s", type=float, default=30.0)
     parser.add_argument("--train-split", choices=("train", "test"), default="train")
     parser.add_argument("--test-split", choices=("train", "test"), default="test")
     parser.add_argument("--train-label", type=int, default=None, help="Support label for dataset mode")
@@ -1705,6 +1819,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weight-file", type=Path, default=Path("stdp_weights.npz"))
     parser.add_argument("--weight-log-dir", type=Path, default=Path("weight_logs"))
     parser.add_argument("--train-rounds", type=int, default=300)
+    parser.add_argument(
+        "--weight-ablation",
+        choices=("none", "initial", "zero-fc", "shuffle-fc"),
+        default="none",
+        help="Validation-only inference ablation; does not modify saved weights",
+    )
+    parser.add_argument("--ablation-seed", type=int, default=0)
+    parser.add_argument(
+        "--fc-row-norm",
+        choices=("none", "unitstd"),
+        default="none",
+        help="Normalize each FC output row before weighted inference; uses trained weights only",
+    )
+    parser.add_argument(
+        "--fc-row-norm-std",
+        type=float,
+        default=0.25,
+        help="Target per-row FC standard deviation for --fc-row-norm unitstd",
+    )
     parser.add_argument(
         "--legacy-protocol",
         action="store_true",
@@ -1743,7 +1876,10 @@ def main(argv: list[str] | None = None) -> int:
         "--gain",
         type=float,
         default=None,
-        help="Scale input pixel intensity before DMA; disables automatic gain sweep",
+        help=(
+            "Scale input pixel intensity before DMA; default is "
+            f"{DEFAULT_WEIGHTED_TRAIN_GAIN:g} for train and {DEFAULT_WEIGHTED_INFER_GAIN:g} for infer"
+        ),
     )
     parser.add_argument(
         "--no-auto-gain",
@@ -1756,10 +1892,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the preprocessed 28x28 input as ASCII pixels",
     )
     args = parser.parse_args(argv)
+    if args.gain is None:
+        args.gain = DEFAULT_WEIGHTED_TRAIN_GAIN if args.mode == "train" else DEFAULT_WEIGHTED_INFER_GAIN
     if args.threshold is not None and not (0 <= args.threshold <= 255):
         raise ValueError("--threshold must be in range [0, 255]")
     if args.gain is not None and args.gain <= 0:
         raise ValueError("--gain must be positive")
+    if args.fc_row_norm_std <= 0:
+        raise ValueError("--fc-row-norm-std must be positive")
     if args.train_rounds < 1:
         raise ValueError("--train-rounds must be positive")
 
